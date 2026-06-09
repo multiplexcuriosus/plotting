@@ -12,8 +12,9 @@ This expects a directory with files like:
 
 It plots:
     - /cartesian_cmd/twist linear_x, linear_y, linear_z as continuous lines
-    - /teleop/gripper_state_cmd data as a step signal on a secondary y-axis
+    - /teleop/gripper_state_cmd data as a binary open/closed step signal on a secondary y-axis
     - /episode/control data as vertical event markers
+    - optional pruned-start markers at episode_start + N_PRUNED_FRAMES / 30 s
     - optional red zero-command regions where selected twist columns are all zero
 
 It also keeps the important functionality of the older single-CSV plotter:
@@ -21,7 +22,7 @@ It also keeps the important functionality of the older single-CSV plotter:
     - relative time axis
     - paired PlotJuggler/RQT *_x / *_y column handling
     - zero-region duration labels
-    - output to file or interactive display
+    - always interactive display; optional output to file via --save
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import matplotlib.pyplot as plt
 import pandas as pd
 
+Y_EPS_START = 300
 
 DEFAULT_TWIST_CSV = "cartesian_cmd__twist.csv"
 DEFAULT_EPISODE_CSV = "episode__control.csv"
@@ -47,6 +49,15 @@ EPISODE_LABELS = {
     3: "cancel current",
     4: "cancel last",
 }
+
+EPISODE_START_STOP_COLOR = "deeppink"
+PRUNED_START_COLOR = EPISODE_START_STOP_COLOR
+TWIST_AXIS_COLORS = {
+    "linear_x": "tab:blue",
+    "linear_y": "tab:orange",
+    "linear_z": "tab:green",
+}
+GRIPPER_COLOR = "lightskyblue"
 
 
 @dataclass
@@ -330,6 +341,59 @@ def relative_time(item: LoadedCsv, t0: float) -> pd.Series:
     return item.time_s_abs.reset_index(drop=True) - t0
 
 
+def prepare_binary_gripper_series(
+    x_values: pd.Series,
+    y_values: pd.Series,
+    start_time: float = 0.0,
+    initial_state: float = 0.0,
+) -> Tuple[pd.Series, pd.Series]:
+    """
+    Prepare a binary gripper step signal and explicitly insert an initial open point.
+
+    The gripper CSV only contains sparse state changes. Adding (t=0, state=open)
+    makes the plot correctly show the initial open configuration until the first
+    actual gripper command/state message.
+    """
+    x = pd.to_numeric(x_values, errors="coerce").reset_index(drop=True)
+    y = pd.to_numeric(y_values, errors="coerce").reset_index(drop=True)
+
+    valid = ~(x.isna() | y.isna())
+    x = x.loc[valid].reset_index(drop=True)
+    y = y.loc[valid].reset_index(drop=True)
+
+    # Keep binary semantics even if the CSV contains bools or tiny numeric noise.
+    y = (y >= 0.5).astype(float)
+
+    initial_x = pd.Series([float(start_time)], dtype=float)
+    initial_y = pd.Series([float(initial_state)], dtype=float)
+
+    if x.empty:
+        return initial_x, initial_y
+
+    x_out = pd.concat([initial_x, x], ignore_index=True)
+    y_out = pd.concat([initial_y, y], ignore_index=True)
+    return x_out, y_out
+
+
+def style_binary_gripper_axis(
+    ax,
+    ymin: float,
+    ymax: float,
+    label_open_closed: bool = True,
+) -> None:
+    """Draw open/closed reference lines and remove numeric y labels."""
+    ax.set_ylim(ymin, ymax)
+    ax.axhline(0.0, linestyle=":", linewidth=1.4, alpha=0.7)
+    ax.axhline(1.0, linestyle=":", linewidth=1.4, alpha=0.7)
+
+    if label_open_closed:
+        ax.set_yticks([0.0, 1.0])
+        ax.set_yticklabels(["open", "closed"], fontweight="bold")
+        ax.tick_params(axis="y", length=0)
+    else:
+        ax.set_yticks([])
+
+
 def plot_zero_regions(
     ax,
     x_values: pd.Series,
@@ -398,7 +462,23 @@ def plot_episode_markers(
     t0: float,
     value_col: str,
     annotate: bool,
+    start_stop_linewidth: float = 2.4,
+    other_linewidth: float = 1.1,
+    start_stop_fontsize: float = 12.0,
+    other_fontsize: float = 8.0,
 ) -> None:
+    """
+    Draw /episode/control markers.
+
+    Values follow the convention used by the recorder:
+        1 = start
+        2 = stop
+        3 = cancel current
+        4 = cancel last
+
+    Start/stop markers intentionally use thicker lines and larger bold labels,
+    because they are the relevant episode-boundary markers for thesis plots.
+    """
     x = relative_time(episode, t0)
     values = pd.to_numeric(episode.df[value_col], errors="coerce")
 
@@ -411,14 +491,29 @@ def plot_episode_markers(
             continue
         int_value = int(value)
         event_name = EPISODE_LABELS.get(int_value, f"episode={int_value}")
-        label = f"episode {event_name}"
-        draw_label = label if label not in used_labels else None
-        used_labels.add(label)
+        if int_value in (1, 2):
+            label = "episode control"
+            draw_label = label if label not in used_labels else "_nolegend_"
+            used_labels.add(label)
+        else:
+            draw_label = "_nolegend_"
 
-        # Keep styling simple but distinct enough for debugging.
-        linestyle = "--" if int_value in (1, 2) else ":"
-        linewidth = 1.3 if int_value in (1, 2) else 1.0
-        ax.axvline(float(xi), linestyle=linestyle, linewidth=linewidth, alpha=0.75, label=draw_label)
+        is_start_stop = int_value in (1, 2)
+        linestyle = "--" if is_start_stop else ":"
+        linewidth = start_stop_linewidth if is_start_stop else other_linewidth
+        fontsize = start_stop_fontsize if is_start_stop else other_fontsize
+        fontweight = "bold" if is_start_stop else "normal"
+        alpha = 0.9 if is_start_stop else 0.7
+        color = EPISODE_START_STOP_COLOR if is_start_stop else None
+
+        ax.axvline(
+            float(xi),
+            linestyle=linestyle,
+            linewidth=linewidth,
+            alpha=alpha,
+            color=color,
+            label=draw_label,
+        )
 
         if annotate:
             ax.text(
@@ -426,15 +521,86 @@ def plot_episode_markers(
                 y_text,
                 event_name,
                 rotation=90,
-                fontsize=8,
+                fontsize=fontsize,
+                fontweight=fontweight,
                 ha="right",
                 va="top",
-                alpha=0.85,
+                color=color,
+                alpha=alpha,
                 clip_on=True,
             )
 
 
-def combine_legends(ax, ax2=None) -> None:
+def plot_pruned_start_markers(
+    ax,
+    episode: LoadedCsv,
+    t0: float,
+    value_col: str,
+    n_pruned_frames: int,
+    fps: float = 30.0,
+    annotate: bool = True,
+    linewidth: float = 2.2,
+    fontsize: float = 10.0,
+) -> None:
+    """
+    Add one additional vertical marker per episode start at
+        t_episode_start + n_pruned_frames / fps.
+
+    This is useful when the HDF5/IL dataset drops the first N sampled frames
+    but the original bag CSV still contains the full episode.
+    """
+    if n_pruned_frames < 0:
+        raise ValueError("--add-pruned-start-line must be >= 0")
+    if fps <= 0:
+        raise ValueError("fps must be positive")
+
+    offset_s = float(n_pruned_frames) / float(fps)
+    x = relative_time(episode, t0)
+    values = pd.to_numeric(episode.df[value_col], errors="coerce")
+
+    y_min, y_max = ax.get_ylim()
+    y_text = y_max - 0.04 * (y_max - y_min) if y_max > y_min else y_max
+
+    label_used = False
+    for xi, value in zip(x, values):
+        if pd.isna(value) or int(value) != 1:
+            continue
+
+        x_pruned = float(xi) + offset_s
+        label = "_nolegend_"
+        label_used = True
+
+        ax.axvline(
+            x_pruned,
+            linestyle=":",
+            linewidth=linewidth,
+            color=PRUNED_START_COLOR,
+            alpha=0.9,
+            label=label,
+        )
+
+        if annotate:
+            ax.text(
+                x_pruned,
+                y_text,
+                f"pruned start",
+                rotation=90,
+                fontsize=fontsize,
+                fontweight="bold",
+                ha="right",
+                va="top",
+                color=PRUNED_START_COLOR,
+                alpha=0.9,
+                clip_on=True,
+            )
+
+def combine_legends(
+    ax,
+    ax2=None,
+    legend_loc: str = "lower left",
+    legend_anchor_x: Optional[float] = None,
+    legend_anchor_y: Optional[float] = None,
+) -> None:
     handles, labels = ax.get_legend_handles_labels()
     if ax2 is not None:
         h2, l2 = ax2.get_legend_handles_labels()
@@ -453,7 +619,17 @@ def combine_legends(ax, ax2=None) -> None:
         final_labels.append(lab)
 
     if final_handles:
-        ax.legend(final_handles, final_labels, loc="best", fontsize=9)
+        legend_kwargs = {
+            "loc": legend_loc,
+            "fontsize": 9,
+        }
+        if legend_anchor_x is not None or legend_anchor_y is not None:
+            legend_kwargs["bbox_to_anchor"] = (
+                0.0 if legend_anchor_x is None else legend_anchor_x,
+                0.0 if legend_anchor_y is None else legend_anchor_y,
+            )
+
+        ax.legend(final_handles, final_labels, **legend_kwargs)
 
 
 def plot_overlay(args: argparse.Namespace) -> None:
@@ -513,7 +689,12 @@ def plot_overlay(args: argparse.Namespace) -> None:
             y_plot = pd.to_numeric(twist.df[y_col], errors="coerce")
             if args.negate_twist:
                 y_plot = -y_plot
-            ax.plot(x_plot, y_plot, label=f"linear {axis}", linewidth=args.linewidth)
+            plot_kwargs = {
+                "label": f"linear {axis}",
+                "linewidth": args.linewidth,
+                "color": TWIST_AXIS_COLORS[f"linear_{axis}"],
+            }
+            ax.plot(x_plot, y_plot, **plot_kwargs)
 
         zero_x = convert_time_to_seconds(twist.df[paired["x"]["x"]], args.paired_time_unit)
         zero_x = zero_x - float(zero_x.dropna().iloc[0])
@@ -534,7 +715,10 @@ def plot_overlay(args: argparse.Namespace) -> None:
             if args.negate_twist:
                 y_plot = -y_plot
             label = args.label_prefix + col if args.label_prefix else col
-            ax.plot(x_twist, y_plot, label=label, linewidth=args.linewidth)
+            plot_kwargs = {"label": label, "linewidth": args.linewidth}
+            if col in TWIST_AXIS_COLORS:
+                plot_kwargs["color"] = TWIST_AXIS_COLORS[col]
+            ax.plot(x_twist, y_plot, **plot_kwargs)
 
         zero_columns = args.zero_columns if args.zero_columns else twist_cols[:3]
         missing_zero_cols = [c for c in zero_columns if c not in twist.df.columns]
@@ -569,16 +753,31 @@ def plot_overlay(args: argparse.Namespace) -> None:
     ax2 = None
     if gripper is not None:
         gripper_col = auto_value_column(gripper.df, args.gripper_column, "gripper")
-        x_gripper = relative_time(gripper, t0)
-        y_gripper = pd.to_numeric(gripper.df[gripper_col], errors="coerce")
+        x_gripper_raw = relative_time(gripper, t0)
+        y_gripper_raw = pd.to_numeric(gripper.df[gripper_col], errors="coerce")
+        x_gripper, y_gripper = prepare_binary_gripper_series(
+            x_gripper_raw,
+            y_gripper_raw,
+            start_time=0.0,
+            initial_state=0.0,  # open
+        )
 
         if args.gripper_on_secondary_axis:
             ax2 = ax.twinx()
+            ax2.set_zorder(0)
+            ax.set_zorder(1)
+            ax.patch.set_visible(False)
             target_ax = ax2
             target_ax.set_ylabel(args.gripper_ylabel, fontsize=11, fontweight="bold")
-            target_ax.set_ylim(args.gripper_ymin, args.gripper_ymax)
         else:
             target_ax = ax
+
+        style_binary_gripper_axis(
+            target_ax,
+            ymin=args.gripper_ymin,
+            ymax=args.gripper_ymax,
+            label_open_closed=not args.no_gripper_open_closed_labels,
+        )
 
         target_ax.step(
             x_gripper,
@@ -586,13 +785,17 @@ def plot_overlay(args: argparse.Namespace) -> None:
             where="post",
             label=args.gripper_label,
             linewidth=args.gripper_linewidth,
-            alpha=0.85,
+            color=GRIPPER_COLOR,
+            alpha=0.9,
+            zorder=3,
         )
         target_ax.scatter(
             x_gripper,
             y_gripper,
             s=args.gripper_marker_size,
-            alpha=0.85,
+            color=GRIPPER_COLOR,
+            alpha=0.9,
+            zorder=4,
         )
 
     if episode is not None:
@@ -604,20 +807,59 @@ def plot_overlay(args: argparse.Namespace) -> None:
             t0,
             value_col=episode_col,
             annotate=not args.no_episode_text,
+            start_stop_linewidth=args.episode_start_stop_linewidth,
+            other_linewidth=args.episode_other_linewidth,
+            start_stop_fontsize=args.episode_start_stop_fontsize,
+            other_fontsize=args.episode_other_fontsize,
         )
 
-    combine_legends(ax, ax2)
+        if args.add_pruned_start_line is not None:
+            plot_pruned_start_markers(
+                ax,
+                episode,
+                t0,
+                value_col=episode_col,
+                n_pruned_frames=args.add_pruned_start_line,
+                fps=args.pruned_start_fps,
+                annotate=not args.no_episode_text,
+                linewidth=args.pruned_start_linewidth,
+                fontsize=args.pruned_start_fontsize,
+            )
+    elif args.add_pruned_start_line is not None:
+        print("[WARNING] --add-pruned-start-line requested, but no episode CSV is loaded.")
+
+    combine_legends(
+        ax,
+        ax2,
+        legend_loc=args.legend_loc,
+        legend_anchor_x=args.legend_anchor_x,
+        legend_anchor_y=args.legend_anchor_y,
+    )
 
     if args.xlim is not None:
         ax.set_xlim(args.xlim[0], args.xlim[1])
 
     fig.tight_layout()
 
-    if args.output:
-        fig.savefig(args.output, dpi=args.dpi, bbox_inches="tight")
-        print(f"Plot saved to {args.output}")
-    else:
-        plt.show()
+    save_path: Optional[Path] = None
+    if args.save is not None:
+        if args.save == "__USE_OUTPUT__":
+            if args.output:
+                save_path = Path(args.output).expanduser()
+            elif input_path.is_dir():
+                save_path = input_path / "twist_traj.png"
+            else:
+                save_path = Path("twist_traj.png")
+        else:
+            save_path = Path(args.save).expanduser()
+    elif args.output is not None:
+        print("[INFO] Positional output path was provided without --save; plot will not be saved.")
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=args.dpi, bbox_inches="tight")
+        print(f"Plot saved to {save_path}")
+
+    plt.show()
 
     plt.close(fig)
 
@@ -633,7 +875,23 @@ def parse_args() -> argparse.Namespace:
             "If this is a directory, default filenames are auto-used."
         ),
     )
-    parser.add_argument("output", nargs="?", default=None, help="Optional output plot path: .svg, .pdf, .eps, .png, ...")
+    parser.add_argument(
+        "output",
+        nargs="?",
+        default=None,
+        help="Deprecated output path. Only used when --save is passed without a path.",
+    )
+    parser.add_argument(
+        "--save",
+        nargs="?",
+        const="__USE_OUTPUT__",
+        default=None,
+        metavar="OUTPUT",
+        help=(
+            "Save plot to file. If OUTPUT is omitted, use positional output when provided; "
+            "otherwise save to twist_traj.png (in input dir when input is a directory)."
+        ),
+    )
 
     parser.add_argument("--twist-csv", default=None, help="Path/name of twist CSV. Default: cartesian_cmd__twist.csv in input dir.")
     parser.add_argument("--gripper-csv", default=None, help="Path/name of gripper CSV. Default: teleop__gripper_state_cmd.csv in input dir.")
@@ -656,6 +914,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-gripper", action="store_true", help="Do not plot gripper CSV even if present.")
     parser.add_argument("--no-episode", action="store_true", help="Do not plot episode CSV even if present.")
     parser.add_argument("--no-episode-text", action="store_true", help="Draw episode vertical lines without text labels.")
+    parser.add_argument("--episode-start-stop-linewidth", type=float, default=2.4, help="Line width for episode start/stop markers.")
+    parser.add_argument("--episode-other-linewidth", type=float, default=1.1, help="Line width for non-start/stop episode markers.")
+    parser.add_argument("--episode-start-stop-fontsize", type=float, default=12.0, help="Font size for start/stop text labels.")
+    parser.add_argument("--episode-other-fontsize", type=float, default=8.0, help="Font size for non-start/stop text labels.")
+    parser.add_argument(
+        "--add-pruned-start-line",
+        type=int,
+        default=None,
+        metavar="N_PRUNED_FRAMES",
+        help="Add vertical line(s) at each episode start plus N_PRUNED_FRAMES / 30 seconds.",
+    )
+    parser.add_argument("--pruned-start-fps", type=float, default=30.0, help="FPS used for --add-pruned-start-line. Default: 30.")
+    parser.add_argument("--pruned-start-linewidth", type=float, default=2.2, help="Line width for pruned-start marker.")
+    parser.add_argument("--pruned-start-fontsize", type=float, default=10.0, help="Font size for pruned-start text label.")
 
     parser.add_argument("--skip-percent", type=float, default=0.0, help="Crop the first N percent of the shared time span.")
     parser.add_argument("--xlim", nargs=2, type=float, default=None, metavar=("START", "END"), help="Visible x-axis range in relative seconds.")
@@ -668,20 +940,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-ylabel", default="Gripper state", help="Secondary y-axis label.")
     parser.add_argument("--gripper-on-secondary-axis", action=argparse.BooleanOptionalAction, default=True, help="Plot gripper on secondary y-axis. Default: true.")
     parser.add_argument("--gripper-ymin", type=float, default=-0.1, help="Secondary gripper axis min.")
-    parser.add_argument("--gripper-ymax", type=float, default=1.1, help="Secondary gripper axis max.")
+    parser.add_argument("--gripper-ymax", type=float, default=1.15, help="Secondary gripper axis max.")
+    parser.add_argument("--no-gripper-open-closed-labels", action="store_true", help="Hide open/closed y-tick labels on gripper axis.")
 
     parser.add_argument("--linewidth", type=float, default=2.0, help="Twist line width.")
-    parser.add_argument("--gripper-linewidth", type=float, default=1.8, help="Gripper step line width.")
-    parser.add_argument("--gripper-marker-size", type=float, default=25.0, help="Gripper marker size.")
+    parser.add_argument("--gripper-linewidth", type=float, default=3.0, help="Gripper step line width.")
+    parser.add_argument("--gripper-marker-size", type=float, default=50.0, help="Gripper marker size.")
     parser.add_argument("--width", type=float, default=12.0, help="Figure width in inches.")
     parser.add_argument("--height", type=float, default=6.0, help="Figure height in inches.")
     parser.add_argument("--dpi", type=int, default=300, help="Output DPI for raster formats.")
+    parser.add_argument("--legend-loc", default="lower left", help="Matplotlib legend loc string. Default: lower left.")
+    parser.add_argument("--legend-anchor-x", type=float, default=None, help="Optional legend anchor x coordinate for fine placement.")
+    parser.add_argument("--legend-anchor-y", type=float, default=None, help="Optional legend anchor y coordinate for fine placement.")
 
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.add_pruned_start_line is not None and args.add_pruned_start_line < 0:
+        raise ValueError("--add-pruned-start-line must be >= 0")
+    if args.pruned_start_fps <= 0:
+        raise ValueError("--pruned-start-fps must be positive")
     plot_overlay(args)
 
 
