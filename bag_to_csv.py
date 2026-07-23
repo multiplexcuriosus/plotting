@@ -1,52 +1,37 @@
 #!/usr/bin/env python3
 """
-Convert selected numeric ROS2 bag topics to CSV.
+Convert ROS 2 bag topics to one CSV per topic.
 
-Typical usage:
-    python3 bag_to_csv.py --bag /path/to/my_bag --out_dir /tmp/bag_csv
-    python3 bag_to_csv.py --bag /path/to/my_bag --out_dir /tmp/bag_csv --use_episode_windows
-    python3 bag_to_csv.py --bag /path/to/my_bag --out_dir /tmp/bag_csv \
-        --topics /cartesian_cmd/twist /joint_states /teleop/gripper_state_cmd
+Default behavior:
+- requires only --bag
+- writes CSV files into <bag>/csv/
+- exports all discovered topics unless --topics is provided
+- auto-detects storage_identifier from metadata.yaml unless --storage_id is provided
 
 Notes:
-- This is meant for numeric plotting data, not image/event-frame data.
-- sensor_msgs/Image topics are skipped by default.
-- Run this inside a ROS2 environment where the relevant message packages are sourced.
+- sensor_msgs/Image and sensor_msgs/CompressedImage are exported as metadata-only rows.
+- raw binary payload buffers are never expanded into CSV cells.
+- run inside a sourced ROS 2 workspace that provides all message definitions used in the bag.
 """
 
 import argparse
 import csv
 import os
 import re
+from collections.abc import Sequence as AbcSequence
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import rosbag2_py
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 
 
-# Defaults copied from the current data-collection / HDF5 conversion workflow.
-TOPIC_RGB = "/camera/camera/color/image_raw"
-TOPIC_EVENT = "/openmv_cam/image"
-TOPIC_JOINT = "/joint_states"
-TOPIC_GRIPPER_STATE = "/teleop/gripper_state_cmd"
-TOPIC_GRIPPER_CMD = "/teleop/gripper_cmd"
-TOPIC_TWIST = "/cartesian_cmd/twist"
 TOPIC_EPISODE = "/episode/control"
 
-DEFAULT_TOPICS = [
-    TOPIC_JOINT,
-    TOPIC_GRIPPER_STATE,
-    TOPIC_GRIPPER_CMD,
-    TOPIC_TWIST,
-    TOPIC_EPISODE,
-]
-
-IMAGE_TYPES = {
-    "sensor_msgs/msg/Image",
-    "sensor_msgs/msg/CompressedImage",
-}
+IMAGE_TYPE = "sensor_msgs/msg/Image"
+COMPRESSED_IMAGE_TYPE = "sensor_msgs/msg/CompressedImage"
+IMAGE_TYPES = {IMAGE_TYPE, COMPRESSED_IMAGE_TYPE}
 
 FRANKA_ARM_JOINTS = [
     "right_fr3_joint1",
@@ -65,6 +50,20 @@ class EpisodeWindow:
     idx: int
     start: float
     end: float
+
+
+@dataclass
+class TopicPass1Info:
+    message_columns: Set[str]
+    rows_candidate: int
+
+
+@dataclass
+class Pass1Result:
+    first_selected_t: Optional[float]
+    all_topic_message_count: Dict[str, int]
+    per_topic: Dict[str, TopicPass1Info]
+    topic_errors: Dict[str, str]
 
 
 def log(msg: str) -> None:
@@ -99,7 +98,7 @@ def safe_column_name(name: str) -> str:
     return name.strip("_") or "field"
 
 
-def open_reader(bag_path: str, storage_id: str = "sqlite3") -> rosbag2_py.SequentialReader:
+def open_reader(bag_path: str, storage_id: str) -> rosbag2_py.SequentialReader:
     storage_options = rosbag2_py.StorageOptions(uri=bag_path, storage_id=storage_id)
     converter_options = rosbag2_py.ConverterOptions(
         input_serialization_format="cdr",
@@ -115,24 +114,107 @@ def get_topic_type_map(reader: rosbag2_py.SequentialReader) -> Dict[str, str]:
     return {x.name: x.type for x in topic_types}
 
 
-def get_type_class_map(topic_type_map: Dict[str, str]) -> Dict[str, Any]:
-    return {topic: get_message(msg_type) for topic, msg_type in topic_type_map.items()}
-
-
 def print_topics(topic_type_map: Dict[str, str]) -> None:
     log("Available topics:")
     for topic in sorted(topic_type_map):
-        log(f"  {topic:<45} {topic_type_map[topic]}")
+        log(f"  {topic:<55} {topic_type_map[topic]}")
+
+
+def detect_storage_id_from_metadata(bag_path: str) -> str:
+    metadata_path = os.path.join(bag_path, "metadata.yaml")
+    if not os.path.exists(metadata_path):
+        raise RuntimeError(
+            "metadata.yaml not found and --storage_id was not provided; "
+            "cannot determine bag storage format"
+        )
+
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    try:
+        import yaml  # type: ignore
+
+        data = yaml.safe_load(text)
+        storage_id = (
+            data.get("rosbag2_bagfile_information", {})
+            .get("storage_identifier", None)
+        )
+        if storage_id:
+            return str(storage_id).strip()
+    except Exception:
+        pass
+
+    # Fallback lightweight parser.
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("storage_identifier:"):
+            value = stripped.split(":", 1)[1].strip().strip("'\"")
+            if value:
+                return value
+
+    raise RuntimeError(
+        "Unable to read storage_identifier from metadata.yaml and --storage_id was not provided"
+    )
+
+
+def resolve_selected_topics(
+    topic_type_map: Dict[str, str],
+    topics: Optional[List[str]],
+    all_numeric: bool,
+    include_image_topics: bool,
+) -> List[str]:
+    available = set(topic_type_map.keys())
+
+    if all_numeric:
+        log("[WARNING] --all_numeric is deprecated; selecting all discovered topics by default")
+
+    if include_image_topics:
+        log("[WARNING] --include_image_topics is now redundant; image topics are exported as metadata-only")
+
+    if topics:
+        missing = [topic for topic in topics if topic not in available]
+        if missing:
+            log(f"[WARNING] requested topics not found and will be skipped: {missing}")
+        return [topic for topic in topics if topic in available]
+
+    return sorted(topic_type_map.keys())
+
+
+def resolve_message_classes_for_topics(
+    selected_topics: Sequence[str],
+    topic_type_map: Dict[str, str],
+) -> Dict[str, Any]:
+    classes: Dict[str, Any] = {}
+    failures: List[str] = []
+
+    for topic in selected_topics:
+        msg_type = topic_type_map[topic]
+        try:
+            classes[topic] = get_message(msg_type)
+        except Exception as exc:
+            failures.append(
+                f"{topic} :: {msg_type} :: {exc}"
+            )
+
+    if failures:
+        lines = [
+            "Failed to load message classes for selected topics.",
+            "Make sure the workspace containing these interfaces is sourced.",
+            "Failures:",
+        ]
+        lines.extend([f"  - {x}" for x in failures])
+        raise RuntimeError("\n".join(lines))
+
+    return classes
 
 
 def extract_episode_windows(
     bag_path: str,
     storage_id: str,
     episode_topic: str = TOPIC_EPISODE,
-) -> List[EpisodeWindow]:
+) -> Tuple[List[EpisodeWindow], int]:
     """
-    Scan /episode/control and apply the same start/stop/cancel semantics as the
-    HDF5 converter:
+    Scan /episode/control semantics:
       1 = start current episode
       2 = stop and commit current episode
       3 = cancel current unfinished episode
@@ -145,16 +227,11 @@ def extract_episode_windows(
     if episode_topic not in topic_type_map:
         raise RuntimeError(f"episode topic not found in bag: {episode_topic}")
 
-    msg_types = get_type_class_map({episode_topic: topic_type_map[episode_topic]})
+    msg_cls = get_message(topic_type_map[episode_topic])
     current_start: Optional[float] = None
     committed_windows: List[EpisodeWindow] = []
 
     n_episode_msgs = 0
-    n_start = 0
-    n_stop = 0
-    n_cancel_current = 0
-    n_cancel_last = 0
-    n_ignored = 0
 
     while reader.has_next():
         topic, raw, t_ns = reader.read_next()
@@ -162,19 +239,17 @@ def extract_episode_windows(
             continue
 
         n_episode_msgs += 1
-        msg = deserialize_message(raw, msg_types[topic])
+        msg = deserialize_message(raw, msg_cls)
         t = bag_timestamp_to_sec(t_ns)
         value = getattr(msg, "data", None)
 
         if value == 1:
-            n_start += 1
             if current_start is None:
                 current_start = t
             else:
                 log("[WARNING] start received while already recording; ignoring duplicate start")
 
         elif value == 2:
-            n_stop += 1
             if current_start is None:
                 log("[WARNING] stop received while not recording; ignoring")
             else:
@@ -184,14 +259,12 @@ def extract_episode_windows(
                 current_start = None
 
         elif value == 3:
-            n_cancel_current += 1
             if current_start is not None:
                 current_start = None
             else:
                 log("[WARNING] cancel_current received while not recording; ignoring")
 
         elif value == 4:
-            n_cancel_last += 1
             if current_start is not None:
                 log("[WARNING] cancel_last received while recording; ignoring")
             elif committed_windows:
@@ -202,19 +275,12 @@ def extract_episode_windows(
                 log("[WARNING] cancel_last received but no committed episode exists")
 
         else:
-            n_ignored += 1
             log(f"[WARNING] unknown episode marker {value}; ignoring")
 
     if current_start is not None:
         log(f"[WARNING] bag ended during unfinished episode from {current_start:.9f}; discarding")
 
-    log(
-        "[INFO] episode marker counts: "
-        f"messages={n_episode_msgs}, start={n_start}, stop={n_stop}, "
-        f"cancel_current={n_cancel_current}, cancel_last={n_cancel_last}, ignored={n_ignored}"
-    )
-
-    return committed_windows
+    return committed_windows, n_episode_msgs
 
 
 def filter_episode_windows(
@@ -262,12 +328,34 @@ def is_scalar(value: Any) -> bool:
     return isinstance(value, (bool, int, float))
 
 
-def is_scalar_sequence(value: Any) -> bool:
-    if isinstance(value, (str, bytes, bytearray)):
+def is_binary_buffer(value: Any) -> bool:
+    return isinstance(value, (bytes, bytearray, memoryview))
+
+
+def is_sequence_like(value: Any) -> bool:
+    if isinstance(value, (str, bytes, bytearray, memoryview)):
         return False
-    if not isinstance(value, (list, tuple)):
+    return isinstance(value, AbcSequence)
+
+
+def is_uint8_like_sequence(value: Any) -> bool:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return True
+    if not is_sequence_like(value):
         return False
-    return all(is_scalar(v) for v in value)
+
+    typecode = getattr(value, "typecode", None)
+    if isinstance(typecode, str) and typecode in {"B", "b"}:
+        return True
+
+    # Fallback heuristic for generic uint8 buffers.
+    try:
+        seq = list(value)
+    except Exception:
+        return False
+    if not seq:
+        return False
+    return all(isinstance(x, int) and 0 <= x <= 255 for x in seq)
 
 
 def add_header_fields(row: Dict[str, Any], msg: Any) -> None:
@@ -278,7 +366,7 @@ def add_header_fields(row: Dict[str, Any], msg: Any) -> None:
     if stamp is not None:
         row["header_stamp"] = stamp_to_sec(stamp)
     frame_id = getattr(header, "frame_id", None)
-    if frame_id:
+    if frame_id is not None:
         row["frame_id"] = frame_id
 
 
@@ -366,15 +454,34 @@ def flatten_joint_state(
     return row, joint_order
 
 
+def flatten_image_metadata(msg: Any, msg_type: str) -> Dict[str, Any]:
+    row: Dict[str, Any] = {}
+    add_header_fields(row, msg)
+
+    if msg_type == IMAGE_TYPE:
+        row["height"] = getattr(msg, "height", "")
+        row["width"] = getattr(msg, "width", "")
+        row["encoding"] = getattr(msg, "encoding", "")
+        row["is_bigendian"] = getattr(msg, "is_bigendian", "")
+        row["step"] = getattr(msg, "step", "")
+        row["data_len"] = len(getattr(msg, "data", b""))
+        return row
+
+    if msg_type == COMPRESSED_IMAGE_TYPE:
+        row["format"] = getattr(msg, "format", "")
+        row["data_len"] = len(getattr(msg, "data", b""))
+        return row
+
+    return row
+
+
 def flatten_generic(
     obj: Any,
     prefix: str = "",
     max_array_len: int = 32,
+    skip_top_level_header: bool = False,
+    _depth: int = 0,
 ) -> Dict[str, Any]:
-    """
-    Recursively flatten scalar ROS message fields.
-    Large arrays are skipped, because they are usually images or dense buffers.
-    """
     row: Dict[str, Any] = {}
 
     if is_scalar(obj):
@@ -385,28 +492,55 @@ def flatten_generic(
         row[safe_column_name(prefix)] = obj
         return row
 
-    if is_scalar_sequence(obj):
-        if len(obj) <= max_array_len:
-            for i, value in enumerate(obj):
-                row[safe_column_name(f"{prefix}_{i}")] = value
-        else:
-            row[safe_column_name(f"{prefix}_len")] = len(obj)
+    if is_binary_buffer(obj):
+        row[safe_column_name(f"{prefix}_len")] = len(obj)
         return row
 
-    if isinstance(obj, (bytes, bytearray, memoryview)):
+    if is_uint8_like_sequence(obj):
         row[safe_column_name(f"{prefix}_len")] = len(obj)
         return row
 
     if hasattr(obj, "get_fields_and_field_types"):
         for field_name in obj.get_fields_and_field_types().keys():
-            if field_name == "header":
-                # Header is handled separately in add_header_fields().
+            if skip_top_level_header and _depth == 0 and field_name == "header":
                 continue
             value = getattr(obj, field_name)
             child_prefix = f"{prefix}_{field_name}" if prefix else field_name
-            row.update(flatten_generic(value, child_prefix, max_array_len=max_array_len))
+            row.update(
+                flatten_generic(
+                    value,
+                    prefix=child_prefix,
+                    max_array_len=max_array_len,
+                    skip_top_level_header=False,
+                    _depth=_depth + 1,
+                )
+            )
         return row
 
+    if is_sequence_like(obj):
+        seq = list(obj)
+        len_key = safe_column_name(f"{prefix}_len") if prefix else "len"
+        row[len_key] = len(seq)
+
+        if len(seq) > max_array_len:
+            return row
+
+        for i, value in enumerate(seq):
+            child_prefix = f"{prefix}_{i}" if prefix else str(i)
+            row.update(
+                flatten_generic(
+                    value,
+                    prefix=child_prefix,
+                    max_array_len=max_array_len,
+                    skip_top_level_header=False,
+                    _depth=_depth + 1,
+                )
+            )
+        return row
+
+    # Unknown object type: keep string repr for visibility.
+    if prefix:
+        row[safe_column_name(prefix)] = str(obj)
     return row
 
 
@@ -421,7 +555,7 @@ def flatten_message(
     max_array_len: int,
 ) -> Dict[str, Any]:
     if msg_type in IMAGE_TYPES:
-        return {}
+        return flatten_image_metadata(msg, msg_type)
 
     if msg_type == "sensor_msgs/msg/JointState":
         row, order = flatten_joint_state(
@@ -440,36 +574,26 @@ def flatten_message(
 
     row: Dict[str, Any] = {}
     add_header_fields(row, msg)
-    row.update(flatten_generic(msg, max_array_len=max_array_len))
+    row.update(
+        flatten_generic(
+            msg,
+            max_array_len=max_array_len,
+            skip_top_level_header=True,
+        )
+    )
     return row
 
 
 class CsvTopicWriter:
-    def __init__(self, path: str):
+    def __init__(self, path: str, columns: Sequence[str]):
         self.path = path
-        self.file = open(path, "w", newline="")
-        self.writer: Optional[csv.DictWriter] = None
-        self.columns: Optional[List[str]] = None
+        self.file = open(path, "w", newline="", encoding="utf-8")
+        self.columns = list(columns)
+        self.writer = csv.DictWriter(self.file, fieldnames=self.columns)
+        self.writer.writeheader()
         self.n_rows = 0
-        self.warned_extra_columns = False
 
     def write(self, row: Dict[str, Any]) -> None:
-        if self.writer is None:
-            self.columns = list(row.keys())
-            self.writer = csv.DictWriter(self.file, fieldnames=self.columns)
-            self.writer.writeheader()
-
-        assert self.writer is not None
-        assert self.columns is not None
-
-        extra_columns = [c for c in row.keys() if c not in self.columns]
-        if extra_columns and not self.warned_extra_columns:
-            log(
-                f"[WARNING] {self.path}: later rows contain new columns that are not in "
-                f"the first row schema and will be ignored: {extra_columns[:10]}"
-            )
-            self.warned_extra_columns = True
-
         self.writer.writerow({c: row.get(c, "") for c in self.columns})
         self.n_rows += 1
 
@@ -477,54 +601,274 @@ class CsvTopicWriter:
         self.file.close()
 
 
-def resolve_selected_topics(
+def pass1_scan(
+    bag_path: str,
+    storage_id: str,
     topic_type_map: Dict[str, str],
-    topics: Optional[List[str]],
-    all_numeric: bool,
-    include_image_topics: bool,
-) -> List[str]:
-    available = set(topic_type_map.keys())
+    selected_topics: Sequence[str],
+    msg_types: Dict[str, Any],
+    windows: Optional[Sequence[EpisodeWindow]],
+    args: argparse.Namespace,
+) -> Pass1Result:
+    reader = open_reader(bag_path, storage_id=storage_id)
+    selected_set = set(selected_topics)
 
-    if all_numeric:
-        selected = []
-        for topic, msg_type in topic_type_map.items():
-            if msg_type in IMAGE_TYPES and not include_image_topics:
+    per_topic: Dict[str, TopicPass1Info] = {
+        topic: TopicPass1Info(message_columns=set(), rows_candidate=0)
+        for topic in selected_topics
+    }
+    all_topic_message_count: Dict[str, int] = {topic: 0 for topic in topic_type_map}
+    topic_errors: Dict[str, str] = {}
+
+    first_selected_t: Optional[float] = None
+    episode_idx_cursor = 0
+    n_scanned = 0
+
+    joint_orders: Dict[str, List[str]] = {}
+
+    while reader.has_next():
+        topic, raw, t_ns = reader.read_next()
+        n_scanned += 1
+
+        if topic in all_topic_message_count:
+            all_topic_message_count[topic] += 1
+
+        if n_scanned % args.progress_every == 0:
+            log(f"[INFO] pass1 scanned {n_scanned} messages")
+
+        if topic not in selected_set:
+            continue
+
+        t_abs = bag_timestamp_to_sec(t_ns)
+        if args.start_sec is not None and t_abs < args.start_sec:
+            continue
+        if args.end_sec is not None and t_abs > args.end_sec:
+            continue
+
+        current_ep: Optional[EpisodeWindow] = None
+        if windows is not None:
+            current_ep, episode_idx_cursor = locate_episode(t_abs, windows, episode_idx_cursor)
+            if current_ep is None:
+                if episode_idx_cursor >= len(windows):
+                    break
                 continue
-            selected.append(topic)
-        return sorted(selected)
 
-    if topics:
-        missing = [topic for topic in topics if topic not in available]
-        if missing:
-            log(f"[WARNING] requested topics not found and will be skipped: {missing}")
-        return [topic for topic in topics if topic in available]
+        if first_selected_t is None:
+            first_selected_t = t_abs
 
-    selected = [topic for topic in DEFAULT_TOPICS if topic in available]
-    if not selected:
-        log("[WARNING] none of the default numeric topics were found")
-    return selected
+        try:
+            msg = deserialize_message(raw, msg_types[topic])
+            data_row = flatten_message(
+                msg,
+                msg_type=topic_type_map[topic],
+                topic=topic,
+                joint_orders=joint_orders,
+                include_velocity=args.include_joint_velocity,
+                include_effort=args.include_joint_effort,
+                add_franka_qpos8=args.franka_qpos8,
+                max_array_len=args.max_array_len,
+            )
+            per_topic[topic].message_columns.update(data_row.keys())
+            per_topic[topic].rows_candidate += 1
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            topic_errors.setdefault(topic, detail)
+            log(f"[ERROR] pass1 flatten failed for {topic} ({topic_type_map[topic]}): {detail}")
+
+    return Pass1Result(
+        first_selected_t=first_selected_t,
+        all_topic_message_count=all_topic_message_count,
+        per_topic=per_topic,
+        topic_errors=topic_errors,
+    )
 
 
-def write_metadata(out_dir: str, topic_type_map: Dict[str, str], selected_topics: Sequence[str]) -> None:
+def pass2_write(
+    bag_path: str,
+    storage_id: str,
+    topic_type_map: Dict[str, str],
+    selected_topics: Sequence[str],
+    msg_types: Dict[str, Any],
+    windows: Optional[Sequence[EpisodeWindow]],
+    pass1: Pass1Result,
+    out_dir: str,
+    args: argparse.Namespace,
+) -> Tuple[Dict[str, int], Dict[str, str], Dict[str, str]]:
+    reader = open_reader(bag_path, storage_id=storage_id)
+    selected_set = set(selected_topics)
+
+    context_columns = ["t_abs", "t_rel"]
+    if windows is not None:
+        context_columns.extend(["episode_idx", "t_episode"])
+
+    writers: Dict[str, CsvTopicWriter] = {}
+    rows_written: Dict[str, int] = {topic: 0 for topic in selected_topics}
+    output_files: Dict[str, str] = {}
+    topic_errors: Dict[str, str] = {}
+
+    for topic in selected_topics:
+        message_columns = sorted(
+            c for c in pass1.per_topic[topic].message_columns if c not in set(context_columns)
+        )
+        columns = context_columns + message_columns
+
+        out_name = safe_filename_from_topic(topic)
+        out_path = os.path.join(out_dir, out_name)
+        writers[topic] = CsvTopicWriter(out_path, columns)
+        output_files[topic] = out_name
+        log(f"[INFO] writing {topic} -> {out_path}")
+
+    first_selected_t = pass1.first_selected_t
+    episode_idx_cursor = 0
+    n_scanned = 0
+
+    joint_orders: Dict[str, List[str]] = {}
+
+    try:
+        while reader.has_next():
+            topic, raw, t_ns = reader.read_next()
+            n_scanned += 1
+
+            if n_scanned % args.progress_every == 0:
+                total_written = sum(rows_written.values())
+                log(f"[INFO] pass2 scanned {n_scanned} messages, wrote {total_written} rows")
+
+            if topic not in selected_set:
+                continue
+
+            t_abs = bag_timestamp_to_sec(t_ns)
+            if args.start_sec is not None and t_abs < args.start_sec:
+                continue
+            if args.end_sec is not None and t_abs > args.end_sec:
+                continue
+
+            current_ep: Optional[EpisodeWindow] = None
+            if windows is not None:
+                current_ep, episode_idx_cursor = locate_episode(t_abs, windows, episode_idx_cursor)
+                if current_ep is None:
+                    if episode_idx_cursor >= len(windows):
+                        break
+                    continue
+
+            if first_selected_t is None:
+                first_selected_t = t_abs
+
+            try:
+                msg = deserialize_message(raw, msg_types[topic])
+                data_row = flatten_message(
+                    msg,
+                    msg_type=topic_type_map[topic],
+                    topic=topic,
+                    joint_orders=joint_orders,
+                    include_velocity=args.include_joint_velocity,
+                    include_effort=args.include_joint_effort,
+                    add_franka_qpos8=args.franka_qpos8,
+                    max_array_len=args.max_array_len,
+                )
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {exc}"
+                log(f"[ERROR] pass2 flatten failed for {topic} ({topic_type_map[topic]}): {detail}")
+                topic_errors.setdefault(topic, detail)
+                continue
+
+            t_rel = 0.0 if first_selected_t is None else (t_abs - first_selected_t)
+            row: Dict[str, Any] = {
+                "t_abs": f"{t_abs:.9f}",
+                "t_rel": f"{t_rel:.9f}",
+            }
+            if current_ep is not None:
+                row["episode_idx"] = current_ep.idx
+                row["t_episode"] = f"{t_abs - current_ep.start:.9f}"
+            row.update(data_row)
+
+            writers[topic].write(row)
+            rows_written[topic] += 1
+
+    finally:
+        for writer in writers.values():
+            writer.close()
+
+    return rows_written, output_files, topic_errors
+
+
+def write_topics_metadata(
+    out_dir: str,
+    topic_type_map: Dict[str, str],
+    selected_topics: Sequence[str],
+    message_count: Dict[str, int],
+    rows_written: Dict[str, int],
+    output_files: Dict[str, str],
+    topic_errors: Dict[str, str],
+) -> None:
+    selected_set = set(selected_topics)
+
     metadata_path = os.path.join(out_dir, "topics_metadata.csv")
-    with open(metadata_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["topic", "type", "selected"])
+    with open(metadata_path, "w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "topic",
+            "type",
+            "selected",
+            "message_count",
+            "rows_written",
+            "output_file",
+            "export_mode",
+            "error",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
+
         for topic in sorted(topic_type_map):
+            msg_type = topic_type_map[topic]
+            selected = topic in selected_set
+            count = int(message_count.get(topic, 0))
+            wrote = int(rows_written.get(topic, 0))
+            out_file = output_files.get(topic, "")
+            err = topic_errors.get(topic, "")
+
+            if not selected:
+                mode = "not_selected"
+            elif err:
+                mode = "error"
+            elif wrote == 0:
+                mode = "empty"
+            elif msg_type in IMAGE_TYPES:
+                mode = "metadata_only"
+            else:
+                mode = "full"
+
             writer.writerow(
                 {
                     "topic": topic,
-                    "type": topic_type_map[topic],
-                    "selected": int(topic in selected_topics),
+                    "type": msg_type,
+                    "selected": int(selected),
+                    "message_count": count,
+                    "rows_written": wrote,
+                    "output_file": out_file,
+                    "export_mode": mode,
+                    "error": err,
                 }
             )
+
     log(f"[INFO] wrote metadata: {metadata_path}")
 
 
 def convert_bag_to_csv(args: argparse.Namespace) -> None:
-    ensure_dir(args.out_dir)
+    bag_path = os.path.abspath(args.bag)
+    if not os.path.isdir(bag_path):
+        raise RuntimeError(f"bag directory does not exist: {bag_path}")
 
-    reader = open_reader(args.bag, storage_id=args.storage_id)
+    storage_id: str
+    if args.storage_id:
+        storage_id = args.storage_id
+        log(f"[INFO] using explicit storage id: {storage_id}")
+    else:
+        storage_id = detect_storage_id_from_metadata(bag_path)
+        log(f"[INFO] detected storage id: {storage_id}")
+
+    out_dir = args.out_dir
+    ensure_dir(out_dir)
+
+    reader = open_reader(bag_path, storage_id=storage_id)
     topic_type_map = get_topic_type_map(reader)
 
     if args.list_topics:
@@ -538,155 +882,117 @@ def convert_bag_to_csv(args: argparse.Namespace) -> None:
         include_image_topics=args.include_image_topics,
     )
 
-    selected_topics = [
-        topic
-        for topic in selected_topics
-        if args.include_image_topics or topic_type_map[topic] not in IMAGE_TYPES
-    ]
-
     if not selected_topics:
         print_topics(topic_type_map)
-        raise RuntimeError(
-            "No topics selected. Use --topics, --all_numeric, or check the available topics above."
-        )
+        raise RuntimeError("No topics selected")
 
     log("[INFO] selected topics:")
     for topic in selected_topics:
         log(f"       {topic} :: {topic_type_map[topic]}")
 
+    # Fail before conversion if selected types are not importable.
+    msg_types = resolve_message_classes_for_topics(selected_topics, topic_type_map)
+
     windows: Optional[List[EpisodeWindow]] = None
     if args.use_episode_windows:
-        raw_windows = extract_episode_windows(args.bag, args.storage_id, args.episode_topic)
+        raw_windows, n_episode_msgs = extract_episode_windows(
+            bag_path,
+            storage_id,
+            args.episode_topic,
+        )
+
+        if n_episode_msgs == 0:
+            raise RuntimeError(
+                "--use_episode_windows requested, but /episode/control contains no messages"
+            )
+
         windows = filter_episode_windows(raw_windows, args.min_duration, args.max_episodes)
         if not windows:
             raise RuntimeError("No episode windows left after filtering")
 
-    # Re-open after optional episode pass.
-    reader = open_reader(args.bag, storage_id=args.storage_id)
-    msg_types = get_type_class_map({topic: topic_type_map[topic] for topic in selected_topics})
+    pass1 = pass1_scan(
+        bag_path=bag_path,
+        storage_id=storage_id,
+        topic_type_map=topic_type_map,
+        selected_topics=selected_topics,
+        msg_types=msg_types,
+        windows=windows,
+        args=args,
+    )
 
-    write_metadata(args.out_dir, topic_type_map, selected_topics)
+    rows_written, output_files, pass2_errors = pass2_write(
+        bag_path=bag_path,
+        storage_id=storage_id,
+        topic_type_map=topic_type_map,
+        selected_topics=selected_topics,
+        msg_types=msg_types,
+        windows=windows,
+        pass1=pass1,
+        out_dir=out_dir,
+        args=args,
+    )
 
-    selected_set = set(selected_topics)
-    writers: Dict[str, CsvTopicWriter] = {}
-    joint_orders: Dict[str, List[str]] = {}
-    first_selected_t: Optional[float] = None
-    episode_idx_cursor = 0
-    n_scanned = 0
-    n_written = 0
-    n_skipped_non_numeric = 0
+    merged_errors = dict(pass1.topic_errors)
+    for topic, detail in pass2_errors.items():
+        merged_errors.setdefault(topic, detail)
 
-    try:
-        while reader.has_next():
-            topic, raw, t_ns = reader.read_next()
-            n_scanned += 1
-
-            if n_scanned % args.progress_every == 0:
-                log(f"[INFO] scanned {n_scanned} messages, wrote {n_written} rows")
-
-            if topic not in selected_set:
-                continue
-
-            msg_type = topic_type_map[topic]
-            if msg_type in IMAGE_TYPES and not args.include_image_topics:
-                n_skipped_non_numeric += 1
-                continue
-
-            t_abs = bag_timestamp_to_sec(t_ns)
-
-            if args.start_sec is not None and t_abs < args.start_sec:
-                continue
-            if args.end_sec is not None and t_abs > args.end_sec:
-                continue
-
-            current_ep: Optional[EpisodeWindow] = None
-            if windows is not None:
-                current_ep, episode_idx_cursor = locate_episode(t_abs, windows, episode_idx_cursor)
-                if current_ep is None:
-                    if episode_idx_cursor >= len(windows):
-                        # Bag is time-ordered. Once all selected episode windows are past,
-                        # nothing else can be written.
-                        break
-                    continue
-
-            if first_selected_t is None:
-                first_selected_t = t_abs
-
-            msg = deserialize_message(raw, msg_types[topic])
-            data_row = flatten_message(
-                msg,
-                msg_type=msg_type,
-                topic=topic,
-                joint_orders=joint_orders,
-                include_velocity=args.include_joint_velocity,
-                include_effort=args.include_joint_effort,
-                add_franka_qpos8=args.franka_qpos8,
-                max_array_len=args.max_array_len,
-            )
-
-            if not data_row:
-                n_skipped_non_numeric += 1
-                continue
-
-            row: Dict[str, Any] = {
-                "t_abs": f"{t_abs:.9f}",
-                "t_rel": f"{t_abs - first_selected_t:.9f}",
-            }
-            if current_ep is not None:
-                row["episode_idx"] = current_ep.idx
-                row["t_episode"] = f"{t_abs - current_ep.start:.9f}"
-            row.update(data_row)
-
-            if topic not in writers:
-                out_path = os.path.join(args.out_dir, safe_filename_from_topic(topic))
-                writers[topic] = CsvTopicWriter(out_path)
-                log(f"[INFO] writing {topic} -> {out_path}")
-
-            writers[topic].write(row)
-            n_written += 1
-
-    finally:
-        for writer in writers.values():
-            writer.close()
+    write_topics_metadata(
+        out_dir=out_dir,
+        topic_type_map=topic_type_map,
+        selected_topics=selected_topics,
+        message_count=pass1.all_topic_message_count,
+        rows_written=rows_written,
+        output_files=output_files,
+        topic_errors=merged_errors,
+    )
 
     log("")
     log("[INFO] conversion summary")
-    log(f"       scanned messages:       {n_scanned}")
-    log(f"       written rows:           {n_written}")
-    log(f"       skipped non-numeric:    {n_skipped_non_numeric}")
-    for topic in sorted(writers):
-        log(f"       {topic}: {writers[topic].n_rows} rows -> {writers[topic].path}")
+    log(f"       selected topics:         {len(selected_topics)}")
+    log(f"       total topics in bag:     {len(topic_type_map)}")
+    log(f"       total rows written:      {sum(rows_written.values())}")
+
+    for topic in sorted(selected_topics):
+        mode = "error" if topic in merged_errors else (
+            "metadata_only" if topic_type_map[topic] in IMAGE_TYPES and rows_written[topic] > 0 else (
+                "empty" if rows_written[topic] == 0 else "full"
+            )
+        )
+        log(
+            f"       {topic}: messages={pass1.all_topic_message_count.get(topic, 0)}, "
+            f"rows={rows_written.get(topic, 0)}, mode={mode}, file={output_files.get(topic, '')}"
+        )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert selected numeric ROS2 bag topics to one CSV file per topic."
+        description="Convert ROS2 bag topics to one CSV file per topic."
     )
     parser.add_argument(
         "--bag",
         required=True,
-        help="Path to ROS2 bag directory. For sqlite3 bags this is usually the directory containing metadata.yaml.",
+        help="Path to ROS2 bag directory (containing metadata.yaml).",
     )
     parser.add_argument(
         "--out_dir",
-        required=True,
-        help="Directory where CSV files will be written.",
+        default=None,
+        help="Optional CSV output directory. Default: <bag>/csv",
     )
     parser.add_argument(
         "--storage_id",
-        default="sqlite3",
-        help="rosbag2 storage id. Default: sqlite3. Use mcap for MCAP bags.",
+        default=None,
+        help="Optional rosbag2 storage id override (e.g. sqlite3, mcap). Default: auto-detect from metadata.yaml.",
     )
     parser.add_argument(
         "--topics",
         nargs="+",
         default=None,
-        help="Specific topics to export. Default: common numeric topics from the thesis workflow.",
+        help="Optional specific topics to export. Default: all discovered topics.",
     )
     parser.add_argument(
         "--all_numeric",
         action="store_true",
-        help="Try exporting all non-image topics. Large arrays are truncated/skipped.",
+        help="Deprecated. No longer needed; all topics are selected by default.",
     )
     parser.add_argument(
         "--list_topics",
@@ -696,7 +1002,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--include_image_topics",
         action="store_true",
-        help="Do not use this for normal plotting. Allows Image topics to be touched, but their data arrays are not fully exported.",
+        help="Deprecated. Image topics are exported as metadata-only rows by default.",
     )
     parser.add_argument(
         "--start_sec",
@@ -751,7 +1057,7 @@ def parse_args() -> argparse.Namespace:
         "--max_array_len",
         type=int,
         default=32,
-        help="Maximum primitive array length to expand for generic messages. Default: 32.",
+        help="Maximum array length to recursively expand in generic flattening. Default: 32.",
     )
     parser.add_argument(
         "--progress_every",
@@ -764,12 +1070,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
     if args.start_sec is not None and args.end_sec is not None and args.end_sec < args.start_sec:
         raise RuntimeError("--end_sec must be >= --start_sec")
     if args.max_episodes is not None and args.max_episodes <= 0:
         raise RuntimeError("--max_episodes must be positive")
     if args.max_array_len < 0:
         raise RuntimeError("--max_array_len must be >= 0")
+
+    args.out_dir = (
+        os.path.abspath(args.out_dir)
+        if args.out_dir
+        else os.path.join(os.path.abspath(args.bag), "csv")
+    )
+
     convert_bag_to_csv(args)
 
 

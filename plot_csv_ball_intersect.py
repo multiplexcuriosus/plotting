@@ -24,8 +24,10 @@ XY table-overlay output:
     interception_xy_overview.png
     episode_XX_xy.png
   The table-frame origin is the bottom-left corner; the table extends along
-  positive x and positive y. By default, the XY view draws the table only up
-  to y=0.80 m even when the physical table is longer.
+    positive x and positive y. The displayed XY rectangle is configurable in
+    centimetres using --table-x-min/--table_x_min, --table-x-max/--table_x_max,
+    --table-y-min/--table_y_min, and --table-y-max/--table_y_max. Defaults:
+    x in [0, 60] cm, y in [0, 80] cm.
 
 Optional TCP support:
   Supply --urdf and --tcp-frame to calculate TCP position from /joint_states
@@ -46,6 +48,14 @@ With FK and table pose:
       --tcp-frame right_fr3_hand_tcp \
       --table-pose-base TX TY TZ QX QY QZ QW
 
+Example XY crop in table-frame centimetres:
+    python3 plot_csv_ball_intersect_mvp.py \
+            --csv-dir /path/to/csv \
+            --out-dir /path/to/plots \
+            --plot-mode xy \
+            --table-x-min 10 --table-x-max 50 \
+            --table-y-min 10 --table-y-max 70
+
 The seven --table-pose-base values describe the table frame pose in robot base:
   [translation xyz, quaternion xyzw] = T_base_table
 """
@@ -64,12 +74,24 @@ import pandas as pd
 from matplotlib.patches import Rectangle
 
 
+SCENE_PRIMARY = "#c62828"       # red
+SCENE_SECONDARY = "#ef6c00"     # orange
+SCENE_LIGHT = "#ff7043"
+ROLLOUT_PRIMARY = "#00796b"     # turquoise
+ROLLOUT_SECONDARY = "#1565c0"   # blue
+EXECUTION_COLOR = "#7b1fa2"     # purple
+NEUTRAL_COLOR = "#555555"
+
+
 TOPICS = {
     "ball": "/scene_localizer/top_cam/ball_3d_table",
     "trajectory": "/scene/ball_trajectory_table",
     "goto_s": "/trajectory_executor/executed_goto_s",
     "goto_target_base": "/trajectory_executor/executed_goto_s_target_base",
     "joints": "/joint_states",
+    "act_prediction": "/act/intercept_prediction",
+    "sic_selected_s": "/interception_controller/selected_goto_s",
+    "ric_selected_s": "/rollout_interception_controller/selected_goto_s",
 }
 
 ARM_JOINTS = [f"right_fr3_joint{i}" for i in range(1, 8)]
@@ -84,6 +106,27 @@ AGGREGATE_SUMMARY_COLUMNS = (
     *TIMING_SUMMARY_COLUMNS,
     "executed_s_from_center_m",
     "duration_s",
+    "prediction_count",
+    "prediction_s_min_m",
+    "prediction_s_mean_m",
+    "prediction_s_max_m",
+    "prediction_probability_min",
+    "prediction_probability_mean",
+    "prediction_probability_max",
+    "sic_selected_s_m",
+    "sic_selected_time_s",
+    "ric_selected_s_m",
+    "ric_selected_time_s",
+    "ric_probability_at_selection",
+    "executed_minus_sic_s_m",
+    "executed_minus_ric_s_m",
+    "ric_minus_sic_s_m",
+    "abs_executed_minus_rollout_m",
+    "abs_executed_from_middle_m",
+    "start_to_scene_s",
+    "start_to_rollout_s",
+    "scene_to_rollout_s",
+    "episode_length_s",
 )
 
 # Default T_base_table = [tx, ty, tz, qx, qy, qz, qw]
@@ -120,6 +163,9 @@ class EpisodeData:
     goto_s: pd.DataFrame
     goto_target_base: pd.DataFrame
     joints: pd.DataFrame
+    act_prediction: pd.DataFrame
+    sic_selected_s: pd.DataFrame
+    ric_selected_s: pd.DataFrame
     tcp_base: Optional[pd.DataFrame] = None
     tcp_table: Optional[pd.DataFrame] = None
     goto_target_table: Optional[pd.DataFrame] = None
@@ -327,11 +373,48 @@ def load_episodes(csv_dir: Path, requested: Optional[Sequence[int]]) -> List[Epi
                 goto_s=episode_parts["goto_s"],
                 goto_target_base=episode_parts["goto_target_base"],
                 joints=episode_parts["joints"],
+                act_prediction=episode_parts["act_prediction"],
+                sic_selected_s=episode_parts["sic_selected_s"],
+                ric_selected_s=episode_parts["ric_selected_s"],
             )
         )
 
     log(f"[INFO] plotting episodes: {[episode.idx for episode in episodes]}")
     return episodes
+
+
+def resolve_prediction_columns_for_episodes(
+    episodes: Sequence[EpisodeData],
+    override_s_column: Optional[str],
+    override_probability_column: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    non_empty_predictions = [ep.act_prediction for ep in episodes if not ep.act_prediction.empty]
+    if not non_empty_predictions:
+        return None, None
+
+    union_columns: List[str] = sorted(
+        {column for df in non_empty_predictions for column in df.columns}
+    )
+    probe = pd.DataFrame(columns=union_columns)
+
+    s_col = prediction_s_column(probe, override=override_s_column)
+    p_col = prediction_probability_column(probe, override=override_probability_column)
+
+    # If lookup on union dataframe failed due no numeric data, retry on first data frame.
+    if s_col is None:
+        s_col = prediction_s_column(non_empty_predictions[0], override=override_s_column)
+    if p_col is None:
+        p_col = prediction_probability_column(non_empty_predictions[0], override=override_probability_column)
+
+    if s_col is None or p_col is None:
+        raise RuntimeError(
+            "Unable to interpret non-empty ACT prediction CSV. "
+            f"Resolved s column={s_col}, probability column={p_col}. "
+            f"Available columns: {union_columns}. "
+            "Use --prediction-s-column and --prediction-probability-column to override."
+        )
+    log(f"[INFO] rollout prediction columns: s={s_col}, probability={p_col}")
+    return s_col, p_col
 
 
 def compute_tcp_base_with_pinocchio(
@@ -503,6 +586,667 @@ def goto_s_value_column(df: pd.DataFrame) -> Optional[str]:
     return numeric_candidates[0] if len(numeric_candidates) == 1 else None
 
 
+def prediction_s_column(
+    df: pd.DataFrame,
+    override: Optional[str] = None,
+) -> Optional[str]:
+    if df.empty:
+        return None
+    if override is not None:
+        if override not in df.columns:
+            raise RuntimeError(
+                f"--prediction-s-column={override!r} not found. "
+                f"Available columns: {list(df.columns)}"
+            )
+        return override
+
+    preferred = ["data_0", "predicted_s", "target_s", "s"]
+    col = first_existing_column(df, preferred)
+    if col is not None:
+        return col
+
+    fuzzy = find_fuzzy_column(
+        df,
+        required_tokens=("pred",),
+        forbidden_tokens=("prob", "conf"),
+    )
+    if fuzzy is not None:
+        return fuzzy
+
+    numeric_candidates = [
+        column
+        for column in df.columns
+        if column not in {"t_abs", "t_rel", "t_episode", "episode_idx", "header_stamp"}
+        and pd.to_numeric(df[column], errors="coerce").notna().any()
+    ]
+    if len(numeric_candidates) == 1:
+        return numeric_candidates[0]
+    return None
+
+
+def prediction_probability_column(
+    df: pd.DataFrame,
+    override: Optional[str] = None,
+) -> Optional[str]:
+    if df.empty:
+        return None
+    if override is not None:
+        if override not in df.columns:
+            raise RuntimeError(
+                f"--prediction-probability-column={override!r} not found. "
+                f"Available columns: {list(df.columns)}"
+            )
+        return override
+
+    preferred = ["data_1", "probability", "execute_probability", "confidence"]
+    col = first_existing_column(df, preferred)
+    if col is not None:
+        return col
+
+    fuzzy = find_fuzzy_column(
+        df,
+        required_tokens=("prob",),
+    )
+    if fuzzy is not None:
+        return fuzzy
+    fuzzy = find_fuzzy_column(df, required_tokens=("conf",))
+    if fuzzy is not None:
+        return fuzzy
+    return None
+
+
+def selected_s_event(df: pd.DataFrame) -> Optional[Tuple[float, float]]:
+    if df.empty:
+        return None
+    s_col = goto_s_value_column(df)
+    if s_col is None:
+        return None
+
+    values = numeric(df, s_col)
+    times = relative_time(df, float(numeric(df, "t_abs").dropna().min()))
+    work = pd.DataFrame({"t": times, "s": values}).replace([np.inf, -np.inf], np.nan).dropna()
+    if work.empty:
+        return None
+    first = work.iloc[0]
+    return float(first["t"]), float(first["s"])
+
+
+def selected_s_event_with_episode_time(
+    df: pd.DataFrame,
+    episode_start_abs: float,
+) -> Optional[Tuple[float, float]]:
+    if df.empty:
+        return None
+    s_col = goto_s_value_column(df)
+    if s_col is None:
+        return None
+
+    times = relative_time(df, episode_start_abs)
+    values = numeric(df, s_col)
+    work = pd.DataFrame({"t": times, "s": values}).replace([np.inf, -np.inf], np.nan).dropna()
+    if work.empty:
+        return None
+    first = work.iloc[0]
+    return float(first["t"]), float(first["s"])
+
+
+def interpolate_1d(
+    t: np.ndarray,
+    values: np.ndarray,
+    query_t: float,
+    max_gap: float,
+) -> Optional[float]:
+    if len(t) == 0:
+        return None
+    if query_t < float(t[0]) or query_t > float(t[-1]):
+        return None
+
+    idx = int(np.searchsorted(t, query_t))
+    if idx == 0:
+        return float(values[0]) if abs(float(t[0]) - query_t) <= max_gap else None
+    if idx >= len(t):
+        return float(values[-1]) if abs(float(t[-1]) - query_t) <= max_gap else None
+
+    t0, t1 = float(t[idx - 1]), float(t[idx])
+    v0, v1 = float(values[idx - 1]), float(values[idx])
+    if t1 <= t0:
+        return None
+    if (t1 - t0) > max_gap:
+        return None
+    alpha = (query_t - t0) / (t1 - t0)
+    return v0 + alpha * (v1 - v0)
+
+
+def interpolate_xy_at_time(
+    x: np.ndarray,
+    y: np.ndarray,
+    t: np.ndarray,
+    query_t: float,
+    max_gap: float,
+) -> Optional[Tuple[float, float]]:
+    x_val = interpolate_1d(t, x, query_t, max_gap)
+    y_val = interpolate_1d(t, y, query_t, max_gap)
+    if x_val is None or y_val is None:
+        return None
+    return x_val, y_val
+
+
+def map_s_to_table_x_m(
+    s_m: np.ndarray,
+    s_zero_x_m: float,
+    s_sign: int,
+) -> np.ndarray:
+    return float(s_zero_x_m) + float(s_sign) * np.asarray(s_m, dtype=float)
+
+
+def extract_prediction_series(
+    episode: EpisodeData,
+    s_column: Optional[str],
+    probability_column: Optional[str],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if (
+        episode.act_prediction.empty
+        or s_column is None
+        or probability_column is None
+        or s_column not in episode.act_prediction.columns
+        or probability_column not in episode.act_prediction.columns
+    ):
+        return np.array([]), np.array([]), np.array([])
+
+    samples = pd.DataFrame(
+        {
+            "t": relative_time(episode.act_prediction, episode.start_abs),
+            "s": numeric(episode.act_prediction, s_column),
+            "p": numeric(episode.act_prediction, probability_column),
+        }
+    ).replace([np.inf, -np.inf], np.nan).dropna().sort_values("t")
+    if samples.empty:
+        return np.array([]), np.array([]), np.array([])
+    return (
+        samples["t"].to_numpy(dtype=float),
+        samples["s"].to_numpy(dtype=float),
+        samples["p"].to_numpy(dtype=float),
+    )
+
+
+def first_executed_s_event(episode: EpisodeData) -> Optional[Tuple[float, float]]:
+    if episode.goto_s.empty:
+        return None
+    s_col = goto_s_value_column(episode.goto_s)
+    if s_col is None:
+        return None
+    work = pd.DataFrame(
+        {
+            "t": relative_time(episode.goto_s, episode.start_abs),
+            "s": numeric(episode.goto_s, s_col),
+        }
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    if work.empty:
+        return None
+    first = work.iloc[0]
+    return float(first["t"]), float(first["s"])
+
+
+def executed_target_x_table_m(episode: EpisodeData) -> Optional[float]:
+    if episode.goto_target_table is None or episode.goto_target_table.empty:
+        return None
+    if "x_table" not in episode.goto_target_table.columns:
+        return None
+    values = numeric(episode.goto_target_table, "x_table").replace([np.inf, -np.inf], np.nan).dropna()
+    if values.empty:
+        return None
+    return float(values.iloc[0])
+
+
+def select_target_xy_at_event(
+    episode: EpisodeData,
+    event_t: Optional[float],
+) -> Optional[Tuple[float, float]]:
+    if episode.goto_target_table is None or episode.goto_target_table.empty or event_t is None:
+        return None
+    x, y, t = finite_xy_time(
+        episode.goto_target_table,
+        episode.start_abs,
+        "x_table",
+        "y_table",
+    )
+    if len(t) == 0:
+        return None
+    idx = int(np.argmin(np.abs(t - event_t)))
+    return float(x[idx]), float(y[idx])
+
+
+def derive_rollout_metrics(
+    episode: EpisodeData,
+    prediction_s_column_name: Optional[str],
+    prediction_probability_column_name: Optional[str],
+    event_match_max_gap_sec: float,
+    s_zero_x_m: float,
+    s_sign: int,
+) -> Dict[str, Optional[float]]:
+    pred_t, pred_s, pred_p = extract_prediction_series(
+        episode,
+        prediction_s_column_name,
+        prediction_probability_column_name,
+    )
+    sic_event = selected_s_event_with_episode_time(episode.sic_selected_s, episode.start_abs)
+    ric_event = selected_s_event_with_episode_time(episode.ric_selected_s, episode.start_abs)
+    exec_event = first_executed_s_event(episode)
+
+    sic_s = None if sic_event is None else float(sic_event[1])
+    sic_t = None if sic_event is None else float(sic_event[0])
+    ric_s = None if ric_event is None else float(ric_event[1])
+    ric_t = None if ric_event is None else float(ric_event[0])
+    exec_s = None if exec_event is None else float(exec_event[1])
+
+    ric_prob = None
+    if ric_t is not None and len(pred_t) > 0:
+        ric_prob = interpolate_1d(pred_t, pred_p, ric_t, event_match_max_gap_sec)
+
+    mapped_exec_x = None if exec_s is None else float(map_s_to_table_x_m(np.asarray([exec_s]), s_zero_x_m, s_sign)[0])
+    observed_exec_x = executed_target_x_table_m(episode)
+    if mapped_exec_x is not None and observed_exec_x is not None:
+        if abs(mapped_exec_x - observed_exec_x) > 0.03:
+            log(
+                f"[WARNING] episode {episode.idx}: s->x mapping and executed target differ by "
+                f"{100.0 * abs(mapped_exec_x - observed_exec_x):.1f} cm; "
+                "check --s-zero-x-m / --s-sign."
+            )
+
+    return {
+        "prediction_count": float(len(pred_s)),
+        "prediction_s_min_m": float(np.min(pred_s)) if len(pred_s) else None,
+        "prediction_s_mean_m": float(np.mean(pred_s)) if len(pred_s) else None,
+        "prediction_s_max_m": float(np.max(pred_s)) if len(pred_s) else None,
+        "prediction_probability_min": float(np.min(pred_p)) if len(pred_p) else None,
+        "prediction_probability_mean": float(np.mean(pred_p)) if len(pred_p) else None,
+        "prediction_probability_max": float(np.max(pred_p)) if len(pred_p) else None,
+        "sic_selected_s_m": sic_s,
+        "sic_selected_time_s": sic_t,
+        "ric_selected_s_m": ric_s,
+        "ric_selected_time_s": ric_t,
+        "ric_probability_at_selection": ric_prob,
+        "executed_minus_sic_s_m": (None if exec_s is None or sic_s is None else float(exec_s - sic_s)),
+        "executed_minus_ric_s_m": (None if exec_s is None or ric_s is None else float(exec_s - ric_s)),
+        "ric_minus_sic_s_m": (None if ric_s is None or sic_s is None else float(ric_s - sic_s)),
+    }
+
+
+def rollout_episode_scalar_metrics(episode: EpisodeData) -> Dict[str, float]:
+    """Per-episode first-event scalar metrics for rollout overview statistics."""
+    nan = float("nan")
+    scene_event = selected_s_event_with_episode_time(episode.sic_selected_s, episode.start_abs)
+    rollout_event = selected_s_event_with_episode_time(episode.ric_selected_s, episode.start_abs)
+    executed_event = first_executed_s_event(episode)
+
+    scene_t = nan if scene_event is None else float(scene_event[0])
+    scene_s = nan if scene_event is None else float(scene_event[1])
+    rollout_t = nan if rollout_event is None else float(rollout_event[0])
+    rollout_s = nan if rollout_event is None else float(rollout_event[1])
+    executed_t = nan if executed_event is None else float(executed_event[0])
+    executed_s = nan if executed_event is None else float(executed_event[1])
+
+    if not math.isfinite(scene_t):
+        scene_t = nan
+    if not math.isfinite(scene_s):
+        scene_s = nan
+    if not math.isfinite(rollout_t):
+        rollout_t = nan
+    if not math.isfinite(rollout_s):
+        rollout_s = nan
+    if not math.isfinite(executed_t):
+        executed_t = nan
+    if not math.isfinite(executed_s):
+        executed_s = nan
+
+    abs_executed_minus_rollout_m = (
+        abs(executed_s - rollout_s)
+        if math.isfinite(executed_s) and math.isfinite(rollout_s)
+        else nan
+    )
+    abs_executed_from_middle_m = abs(executed_s) if math.isfinite(executed_s) else nan
+    start_to_scene_s = scene_t if math.isfinite(scene_t) else nan
+    start_to_rollout_s = rollout_t if math.isfinite(rollout_t) else nan
+    scene_to_rollout_s = (
+        rollout_t - scene_t
+        if math.isfinite(rollout_t) and math.isfinite(scene_t)
+        else nan
+    )
+    episode_length_s = (
+        float(episode.end_abs - episode.start_abs)
+        if math.isfinite(float(episode.end_abs)) and math.isfinite(float(episode.start_abs))
+        else nan
+    )
+
+    return {
+        "abs_executed_minus_rollout_m": abs_executed_minus_rollout_m,
+        "abs_executed_from_middle_m": abs_executed_from_middle_m,
+        "start_to_scene_s": start_to_scene_s,
+        "start_to_rollout_s": start_to_rollout_s,
+        "scene_to_rollout_s": scene_to_rollout_s,
+        "episode_length_s": episode_length_s,
+        "scene_time_s": scene_t,
+        "scene_s_m": scene_s,
+        "rollout_time_s": rollout_t,
+        "rollout_selected_s_m": rollout_s,
+        "executed_time_s": executed_t,
+        "executed_s_m": executed_s,
+    }
+
+
+def finite_stats(values: Sequence[float]) -> Dict[str, float]:
+    arr = np.asarray(list(values), dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {
+            "min": float("nan"),
+            "mean": float("nan"),
+            "max": float("nan"),
+            "count": 0,
+        }
+    return {
+        "min": float(np.min(arr)),
+        "mean": float(np.mean(arr)),
+        "max": float(np.max(arr)),
+        "count": int(arr.size),
+    }
+
+
+def rollout_aggregate_statistics(
+    episodes: Sequence[EpisodeData],
+) -> Dict[str, Dict[str, float]]:
+    metrics = [rollout_episode_scalar_metrics(episode) for episode in episodes]
+
+    def values_for(key: str) -> List[float]:
+        return [float(row.get(key, float("nan"))) for row in metrics]
+
+    keys = (
+        "abs_executed_minus_rollout_m",
+        "abs_executed_from_middle_m",
+        "start_to_scene_s",
+        "start_to_rollout_s",
+        "scene_to_rollout_s",
+        "episode_length_s",
+    )
+    return {key: finite_stats(values_for(key)) for key in keys}
+
+
+def rollout_overview_statistics_text(
+    aggregate: Dict[str, Dict[str, float]],
+) -> str:
+    def fmt_stats_row(
+        label: str,
+        stats: Dict[str, float],
+        scale: float,
+        decimals: int,
+    ) -> str:
+        count = int(stats["count"])
+        if count == 0:
+            value_text = "n/a / n/a / n/a"
+        else:
+            min_v = scale * float(stats["min"])
+            mean_v = scale * float(stats["mean"])
+            max_v = scale * float(stats["max"])
+            value_text = f"{min_v:.{decimals}f} / {mean_v:.{decimals}f} / {max_v:.{decimals}f}"
+        return f"{label:<28} {value_text:<21} (n={count})"
+
+    lines = [
+        "Aggregate statistics (min / mean / max)",
+        "",
+        fmt_stats_row("|Executed - Rollout| [cm]", aggregate["abs_executed_minus_rollout_m"], 100.0, 1),
+        fmt_stats_row("|Executed s| [cm]", aggregate["abs_executed_from_middle_m"], 100.0, 1),
+        fmt_stats_row("Start -> Scene [s]", aggregate["start_to_scene_s"], 1.0, 2),
+        fmt_stats_row("Start -> Rollout [s]", aggregate["start_to_rollout_s"], 1.0, 2),
+        fmt_stats_row("Scene -> Rollout [s]", aggregate["scene_to_rollout_s"], 1.0, 2),
+        fmt_stats_row("Episode length [s]", aggregate["episode_length_s"], 1.0, 2),
+    ]
+    return "\n".join(lines)
+
+
+def draw_rollout_xy_panel(
+    ax,
+    episode: EpisodeData,
+    table_bounds_cm: Tuple[float, float, float, float],
+    prediction_s_column_name: Optional[str],
+    prediction_probability_column_name: Optional[str],
+    s_zero_x_m: float,
+    s_sign: int,
+    interception_y_m: Optional[float],
+    event_match_max_gap_sec: float,
+    prediction_y_offset_cm: float,
+    eef_y_offset_cm: float,
+    annotate: bool,
+) -> Dict[str, object]:
+    ric_info_text: Optional[str] = None
+    exec_info_text: Optional[str] = None
+
+    inferred_interception_cm = infer_interception_y_cm(episode)
+    interception_y_cm = (
+        100.0 * float(interception_y_m)
+        if interception_y_m is not None
+        else inferred_interception_cm
+    )
+    if interception_y_cm is None:
+        table_x_min_cm, table_x_max_cm, table_y_min_cm, table_y_max_cm = table_bounds_cm
+        interception_y_cm = 0.5 * (table_y_min_cm + table_y_max_cm)
+
+    draw_table_frame_overlay(ax, table_bounds_cm, interception_y_cm=interception_y_cm, line_color=SCENE_SECONDARY)
+
+    ball_x, ball_y, ball_t = finite_xy_time(episode.ball, episode.start_abs, "point_x", "point_y")
+    ball_x_cm = 100.0 * ball_x
+    ball_y_cm = 100.0 * ball_y
+    if len(ball_x_cm) > 0:
+        ax.plot(ball_x_cm, ball_y_cm, color=SCENE_PRIMARY, linewidth=2.0, label="Ball trajectory", zorder=4)
+
+    if episode.tcp_table is not None and not episode.tcp_table.empty:
+        tcp_x, tcp_y, _ = finite_xy_time(
+            episode.tcp_table,
+            episode.start_abs,
+            "x_table",
+            "y_table",
+        )
+        if len(tcp_x) > 0:
+            eef_y_cm = np.full_like(tcp_x, interception_y_cm + float(eef_y_offset_cm))
+            eef_x_cm = 100.0 * tcp_x
+            ax.plot(
+                eef_x_cm,
+                eef_y_cm,
+                color="#ec407a",
+                linewidth=1.9,
+                label="EEF trajectory",
+                zorder=4,
+            )
+            eef_start_x = float(eef_x_cm[0])
+            eef_end_x = float(eef_x_cm[-1])
+            eef_y_value = float(eef_y_cm[0])
+            ax.plot([eef_start_x, eef_start_x], [interception_y_cm, eef_y_value], color="#ec407a", linewidth=1.0, zorder=5)
+            ax.plot([eef_end_x, eef_end_x], [interception_y_cm, eef_y_value], color="#ec407a", linewidth=1.0, zorder=5)
+            if len(eef_x_cm) > 1:
+                arrow_start = max(0, len(eef_x_cm) // 3)
+                arrow_end = min(len(eef_x_cm) - 1, arrow_start + max(1, len(eef_x_cm) // 5))
+                if arrow_end > arrow_start:
+                    ax.annotate(
+                        "",
+                        xy=(float(eef_x_cm[arrow_end]), eef_y_value),
+                        xytext=(float(eef_x_cm[arrow_start]), eef_y_value),
+                        arrowprops={"arrowstyle": "-|>", "color": "#ec407a", "lw": 1.1},
+                        zorder=6,
+                    )
+
+    pred_t, pred_s, pred_p = extract_prediction_series(
+        episode,
+        prediction_s_column_name,
+        prediction_probability_column_name,
+    )
+    if len(pred_s) > 0:
+        pred_x_cm = 100.0 * map_s_to_table_x_m(pred_s, s_zero_x_m, s_sign)
+        pred_y_cm = np.full_like(pred_x_cm, interception_y_cm + float(prediction_y_offset_cm))
+        ax.plot(
+            pred_x_cm,
+            pred_y_cm,
+            color=ROLLOUT_PRIMARY,
+            linewidth=1.5,
+            marker="o",
+            markersize=4,
+            markerfacecolor=ROLLOUT_PRIMARY,
+            markeredgecolor="white",
+            markeredgewidth=0.4,
+            alpha=0.9,
+            label="Rollout prediction evolution",
+            zorder=6,
+        )
+        pred_start_x = float(pred_x_cm[0])
+        pred_end_x = float(pred_x_cm[-1])
+        pred_y_value = float(pred_y_cm[0])
+        ax.plot([pred_start_x, pred_start_x], [interception_y_cm, pred_y_value], color=ROLLOUT_PRIMARY, linewidth=1.0, zorder=5)
+        ax.plot([pred_end_x, pred_end_x], [interception_y_cm, pred_y_value], color=ROLLOUT_PRIMARY, linewidth=1.0, zorder=5)
+        if len(pred_x_cm) > 1:
+            arrow_start = max(0, len(pred_x_cm) // 3)
+            arrow_end = min(len(pred_x_cm) - 1, arrow_start + max(1, len(pred_x_cm) // 5))
+            if arrow_end > arrow_start:
+                ax.annotate(
+                    "",
+                    xy=(float(pred_x_cm[arrow_end]), pred_y_value),
+                    xytext=(float(pred_x_cm[arrow_start]), pred_y_value),
+                    arrowprops={"arrowstyle": "-|>", "color": ROLLOUT_PRIMARY, "lw": 1.1},
+                    zorder=7,
+                )
+
+    sic_event = selected_s_event_with_episode_time(episode.sic_selected_s, episode.start_abs)
+    ric_event = selected_s_event_with_episode_time(episode.ric_selected_s, episode.start_abs)
+    exec_event = first_executed_s_event(episode)
+
+    if sic_event is not None:
+        sic_t, sic_s = sic_event
+        sic_x_cm = 100.0 * float(map_s_to_table_x_m(np.asarray([sic_s]), s_zero_x_m, s_sign)[0])
+        ax.scatter([sic_x_cm], [interception_y_cm], marker="^", s=88, color=SCENE_SECONDARY, label="Scene selected s", zorder=8)
+
+    ric_probability = None
+    if ric_event is not None:
+        ric_t, ric_s = ric_event
+        ric_x_cm = 100.0 * float(map_s_to_table_x_m(np.asarray([ric_s]), s_zero_x_m, s_sign)[0])
+        ax.scatter([ric_x_cm], [interception_y_cm], marker="v", s=88, color=ROLLOUT_SECONDARY, label="Rollout selected s", zorder=9)
+        if len(pred_t) > 0:
+            ric_probability = interpolate_1d(pred_t, pred_p, ric_t, event_match_max_gap_sec)
+
+        ric_ball_xy = interpolate_xy_at_time(ball_x, ball_y, ball_t, ric_t, event_match_max_gap_sec)
+        if ric_ball_xy is None:
+            log(
+                f"[WARNING] episode {episode.idx}: cannot interpolate ball pose at RIC selection "
+                f"t={ric_t:.3f}s with max gap {event_match_max_gap_sec:.3f}s"
+            )
+        else:
+            ric_ball_x_cm, ric_ball_y_cm = 100.0 * ric_ball_xy[0], 100.0 * ric_ball_xy[1]
+            ax.scatter(
+                [ric_ball_x_cm],
+                [ric_ball_y_cm],
+                marker="o",
+                s=74,
+                facecolors="white",
+                edgecolors=ROLLOUT_SECONDARY,
+                linewidths=1.8,
+                label="Ball at Rollout selection",
+                zorder=10,
+            )
+            ax.plot(
+                [ric_ball_x_cm, ric_x_cm],
+                [ric_ball_y_cm, interception_y_cm],
+                color=ROLLOUT_SECONDARY,
+                linestyle="--",
+                linewidth=1.7,
+                label="Ball@Rollout -> Rollout target",
+                zorder=7,
+            )
+        if annotate:
+            prob_text = "n/a" if ric_probability is None else f"{ric_probability:.2f}"
+            ric_info_text = f"Rollout\nt={ric_t:.2f}s\ns={100 * ric_s:.1f}cm\np={prob_text}"
+
+    if exec_event is not None:
+        exec_t, exec_s = exec_event
+        exec_x_cm = 100.0 * float(map_s_to_table_x_m(np.asarray([exec_s]), s_zero_x_m, s_sign)[0])
+        ax.scatter([exec_x_cm], [interception_y_cm], marker="X", s=96, color=EXECUTION_COLOR, label="Actual executed s", zorder=9)
+
+        if len(ball_t) > 0:
+            exec_ball_xy = interpolate_xy_at_time(ball_x, ball_y, ball_t, exec_t, event_match_max_gap_sec)
+            if exec_ball_xy is not None:
+                exec_ball_x_cm, exec_ball_y_cm = 100.0 * exec_ball_xy[0], 100.0 * exec_ball_xy[1]
+                ax.scatter(
+                    [exec_ball_x_cm],
+                    [exec_ball_y_cm],
+                    marker="o",
+                    s=70,
+                    facecolors="white",
+                    edgecolors=EXECUTION_COLOR,
+                    linewidths=1.8,
+                    label="Actual execution event",
+                    zorder=10,
+                )
+                ax.plot(
+                    [exec_ball_x_cm, exec_x_cm],
+                    [exec_ball_y_cm, interception_y_cm],
+                    color=EXECUTION_COLOR,
+                    linestyle=":",
+                    linewidth=1.7,
+                    zorder=7,
+                )
+        if annotate:
+            exec_info_text = (
+                "Actual Execution\n"
+                f"t={exec_t:.2f}s\n"
+                f"s={100.0 * exec_s:.1f}cm"
+            )
+
+    ax.set_xlabel("x_table [cm]")
+    ax.set_ylabel("y_table [cm]")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.3)
+    ax.axvline(100.0 * 0.30, color="black", linestyle=":", linewidth=0.8, zorder=2)
+    table_x_min_cm, table_x_max_cm, table_y_min_cm, table_y_max_cm = table_bounds_cm
+    ax.set_xlim(table_x_min_cm, table_x_max_cm)
+    ax.set_ylim(table_y_min_cm, table_y_max_cm)
+
+    if annotate:
+        base_text_box = {
+            "boxstyle": "round,pad=0.3",
+            "facecolor": "white",
+            "alpha": 0.9,
+        }
+        if ric_info_text is not None:
+            rollout_box = dict(base_text_box)
+            rollout_box["edgecolor"] = ROLLOUT_SECONDARY
+            ax.text(
+                0.02,
+                0.82,
+                ric_info_text,
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=8,
+                color=ROLLOUT_SECONDARY,
+                bbox=rollout_box,
+                zorder=20,
+            )
+        if exec_info_text is not None:
+            execution_box = dict(base_text_box)
+            execution_box["edgecolor"] = EXECUTION_COLOR
+            ax.text(
+                0.02,
+                0.62,
+                exec_info_text,
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=8,
+                color=EXECUTION_COLOR,
+                bbox=execution_box,
+                zorder=20,
+            )
+
+    return {
+        "ric_probability_at_selection": ric_probability,
+    }
+
+
 def draw_execution_markers(ax, episode: EpisodeData, annotate: bool = True) -> None:
     if episode.goto_s.empty:
         return
@@ -627,54 +1371,76 @@ def finite_xy_time(
 
 def draw_table_frame_overlay(
     ax,
-    table_size_m: Tuple[float, float],
+    table_bounds_cm: Tuple[float, float, float, float],
     interception_y_cm: Optional[float],
-) -> Tuple[float, float]:
+    line_color: str = "#d65f8d",
+) -> None:
     """Draw a top-down table whose frame origin is its bottom-left corner."""
-    table_x_cm = 100.0 * float(table_size_m[0])
-    table_y_cm = 100.0 * float(table_size_m[1])
+    table_x_min_cm, table_x_max_cm, table_y_min_cm, table_y_max_cm = table_bounds_cm
+    table_width_cm = table_x_max_cm - table_x_min_cm
+    table_height_cm = table_y_max_cm - table_y_min_cm
 
     ax.add_patch(
         Rectangle(
-            (0.0, 0.0),
-            table_x_cm,
-            table_y_cm,
+            (table_x_min_cm, table_y_min_cm),
+            table_width_cm,
+            table_height_cm,
             facecolor="#eef5e9",
             edgecolor="#496a43",
             linewidth=2.0,
-            label=f"Displayed table area (y≤{table_y_cm:.0f} cm)",
+            # label=(
+            #     "Displayed table area "
+            #     f"(x=[{table_x_min_cm:.1f}, {table_x_max_cm:.1f}] cm, "
+            #     f"y=[{table_y_min_cm:.1f}, {table_y_max_cm:.1f}] cm)"
+            # ),
             zorder=0,
         )
     )
 
     if interception_y_cm is not None and math.isfinite(interception_y_cm):
         ax.plot(
-            [0.0, table_x_cm],
+            [table_x_min_cm, table_x_max_cm],
             [interception_y_cm, interception_y_cm],
-            color="#d65f8d",
+            color=line_color,
             linestyle="--",
             linewidth=1.6,
             label=f"Interception line (y={interception_y_cm:.1f} cm)",
             zorder=1,
         )
 
-    arrow_x = 0.22 * table_x_cm
-    arrow_y = 0.16 * table_y_cm
-    arrow_style = {"arrowstyle": "-|>", "color": "#303030", "lw": 1.4}
-    ax.annotate("", xy=(arrow_x, 0.0), xytext=(0.0, 0.0), arrowprops=arrow_style, zorder=2)
-    ax.annotate("", xy=(0.0, arrow_y), xytext=(0.0, 0.0), arrowprops=arrow_style, zorder=2)
-    ax.text(arrow_x, 0.0, " +x", ha="left", va="center", fontsize=8, color="#303030")
-    ax.text(0.0, arrow_y, " +y", ha="center", va="bottom", fontsize=8, color="#303030")
-    ax.scatter([0.0], [0.0], marker="+", s=45, color="#303030", zorder=3)
-    ax.annotate(
-        "origin",
-        xy=(0.0, 0.0),
-        xytext=(5, 5),
-        textcoords="offset points",
-        fontsize=8,
-        color="#303030",
+    origin_in_bounds = (
+        table_x_min_cm <= 0.0 <= table_x_max_cm
+        and table_y_min_cm <= 0.0 <= table_y_max_cm
     )
-    return table_x_cm, table_y_cm
+    if origin_in_bounds:
+        arrow_dx = min(0.22 * table_width_cm, table_x_max_cm)
+        arrow_dy = min(0.16 * table_height_cm, table_y_max_cm)
+        arrow_style = {"arrowstyle": "-|>", "color": "#303030", "lw": 1.4}
+        ax.annotate(
+            "",
+            xy=(arrow_dx, 0.0),
+            xytext=(0.0, 0.0),
+            arrowprops=arrow_style,
+            zorder=2,
+        )
+        ax.annotate(
+            "",
+            xy=(0.0, arrow_dy),
+            xytext=(0.0, 0.0),
+            arrowprops=arrow_style,
+            zorder=2,
+        )
+        ax.text(arrow_dx, 0.0, " +x", ha="left", va="center", fontsize=8, color="#303030")
+        ax.text(0.0, arrow_dy, " +y", ha="center", va="bottom", fontsize=8, color="#303030")
+        ax.scatter([0.0], [0.0], marker="+", s=45, color="#303030", zorder=3)
+        ax.annotate(
+            "origin",
+            xy=(0.0, 0.0),
+            xytext=(5, 5),
+            textcoords="offset points",
+            fontsize=8,
+            color="#303030",
+        )
 
 
 def infer_interception_y_cm(episode: EpisodeData) -> Optional[float]:
@@ -747,20 +1513,20 @@ def draw_xy_timing_overlay(
     episode_duration = max(0.0, episode.end_abs - episode.start_abs)
     lines = [
         "Timing from topic stamps",
-        f"start → executed_goto_s: {timing_delta_text(0.0, goto_event_t)}",
+        f"start → exec_goto_s: {timing_delta_text(0.0, goto_event_t)}",
         (
-            "executed_goto_s → ball max-y: "
+            "exec_goto_s → ball max-y: "
             f"{timing_delta_text(goto_event_t, farthest_y_t)}"
         ),
-        f"ball max-y → episode end: {timing_delta_text(farthest_y_t, episode_duration)}",
+        f"ball max-y → eps end: {timing_delta_text(farthest_y_t, episode_duration)}",
     ]
     ax.text(
-        0.98,
+        0.02,
         0.02,
         "\n".join(lines),
         transform=ax.transAxes,
-        ha="right",
-        va="bottom",
+        ha="left",
+        va="baseline",
         fontsize=6.8 if compact else 8.5,
         linespacing=1.3,
         bbox={
@@ -781,11 +1547,11 @@ def draw_xy_distance_overlay(
     distance_text = "n/a" if distance_cm is None else f"{distance_cm:.2f} cm"
     ax.text(
         0.02,
-        0.02,
+        0.5,
         "Planar distance\nball max-y → final TCP\n" f"d_xy = {distance_text}",
         transform=ax.transAxes,
         ha="left",
-        va="bottom",
+        va="top",
         fontsize=6.8 if compact else 8.5,
         linespacing=1.3,
         bbox={
@@ -831,13 +1597,13 @@ def draw_path_direction_arrows(
 def plot_episode_xy_axis(
     ax,
     episode: EpisodeData,
-    table_size_m: Tuple[float, float],
+    table_bounds_cm: Tuple[float, float, float, float],
     annotate_execution: bool,
 ) -> None:
     """Plot one episode as a top-down table-frame XY path overlay."""
-    table_x_cm, table_y_cm = draw_table_frame_overlay(
+    draw_table_frame_overlay(
         ax,
-        table_size_m,
+        table_bounds_cm,
         interception_y_cm=infer_interception_y_cm(episode),
     )
 
@@ -869,7 +1635,7 @@ def plot_episode_xy_axis(
             facecolors="white",
             edgecolors=ball_color,
             linewidths=1.6,
-            label="Ball start/end",
+            #label="Ball start/end",
             zorder=6,
         )
         ax.scatter(
@@ -890,12 +1656,10 @@ def plot_episode_xy_axis(
             facecolors="#ffeb3b",
             edgecolors="#5d4037",
             linewidths=1.4,
-            label="Ball farthest-y point",
+            #label="Ball farthest-y point",
             zorder=8,
         )
 
-    all_x = [ball_x_cm]
-    all_y = [ball_y_cm]
     max_y_to_final_tcp_distance_cm: Optional[float] = None
 
     if episode.tcp_table is not None and not episode.tcp_table.empty:
@@ -922,8 +1686,6 @@ def plot_episode_xy_axis(
                 float(ball_x_cm[farthest_y_idx] - tcp_x_cm[-1]),
                 float(ball_y_cm[farthest_y_idx] - tcp_y_cm[-1]),
             )
-        all_x.append(tcp_x_cm)
-        all_y.append(tcp_y_cm)
 
     target_x_cm = np.array([])
     target_y_cm = np.array([])
@@ -947,9 +1709,6 @@ def plot_episode_xy_axis(
             label="Executed target",
             zorder=7,
         )
-        all_x.append(target_x_cm)
-        all_y.append(target_y_cm)
-
     # The topic timestamp does not itself identify goal-acceptance versus motion
     # completion semantics. Use the neutral term "event" and mark the nearest
     # measured ball position without inventing an interpolated spatial sample.
@@ -1012,23 +1771,16 @@ def plot_episode_xy_axis(
     ax.set_ylabel("y_table [cm]")
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, alpha=0.3)
-
-    finite_x = np.concatenate([values[np.isfinite(values)] for values in all_x])
-    finite_y = np.concatenate([values[np.isfinite(values)] for values in all_y])
-    x_min = min(0.0, float(finite_x.min())) if finite_x.size else 0.0
-    x_max = max(table_x_cm, float(finite_x.max())) if finite_x.size else table_x_cm
-    y_min = min(0.0, float(finite_y.min())) if finite_y.size else 0.0
-    y_max = max(table_y_cm, float(finite_y.max())) if finite_y.size else table_y_cm
-    margin = 0.04 * max(x_max - x_min, y_max - y_min)
-    ax.set_xlim(x_min - margin, x_max + margin)
-    ax.set_ylim(y_min - margin, y_max + margin)
+    table_x_min_cm, table_x_max_cm, table_y_min_cm, table_y_max_cm = table_bounds_cm
+    ax.set_xlim(table_x_min_cm, table_x_max_cm)
+    ax.set_ylim(table_y_min_cm, table_y_max_cm)
 
 
 def plot_xy_overview(
     episodes: Sequence[EpisodeData],
     output: Path,
     columns: int,
-    table_size_m: Tuple[float, float],
+    table_bounds_cm: Tuple[float, float, float, float],
 ) -> None:
     n = len(episodes)
     rows = math.ceil(n / columns)
@@ -1043,7 +1795,7 @@ def plot_xy_overview(
         plot_episode_xy_axis(
             ax,
             episode,
-            table_size_m=table_size_m,
+            table_bounds_cm=table_bounds_cm,
             annotate_execution=False,
         )
         duration = max(0.0, episode.end_abs - episode.start_abs)
@@ -1068,7 +1820,7 @@ def plot_xy_overview(
         fig.legend(
             handles,
             labels,
-            loc="upper center",
+            loc="center right",
             bbox_to_anchor=(0.5, 0.965),
             ncol=min(4, len(labels)),
             fontsize=9,
@@ -1090,13 +1842,13 @@ def plot_xy_overview(
 def plot_episode_xy(
     episode: EpisodeData,
     output: Path,
-    table_size_m: Tuple[float, float],
+    table_bounds_cm: Tuple[float, float, float, float],
 ) -> None:
     fig, ax = plt.subplots(figsize=(8.5, 9.5))
     plot_episode_xy_axis(
         ax,
         episode,
-        table_size_m=table_size_m,
+        table_bounds_cm=table_bounds_cm,
         annotate_execution=True,
     )
     ax.set_title(
@@ -1107,9 +1859,323 @@ def plot_episode_xy(
     )
     handles, labels = ax.get_legend_handles_labels()
     if handles:
-        ax.legend(loc="upper left", fontsize=9)
+        ax.legend(loc="lower left",bbox_to_anchor=(0.02, 0.02),  fontsize=9)
 
     fig.tight_layout()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    log(f"[INFO] wrote {output}")
+
+
+def plot_rollout_overview(
+    episodes: Sequence[EpisodeData],
+    output: Path,
+    columns: int,
+    table_bounds_cm: Tuple[float, float, float, float],
+    prediction_s_column_name: Optional[str],
+    prediction_probability_column_name: Optional[str],
+    s_zero_x_m: float,
+    s_sign: int,
+    interception_y_m: Optional[float],
+    event_match_max_gap_sec: float,
+    prediction_y_offset_cm: float,
+    eef_y_offset_cm: float,
+) -> None:
+    n = len(episodes)
+    rows = math.ceil(n / columns)
+    fig, axes = plt.subplots(
+        rows,
+        columns,
+        figsize=(5.6 * columns, 4.7 * rows),
+        squeeze=False,
+    )
+
+    for ax, episode in zip(axes.flat, episodes):
+        draw_rollout_xy_panel(
+            ax,
+            episode,
+            table_bounds_cm=table_bounds_cm,
+            prediction_s_column_name=prediction_s_column_name,
+            prediction_probability_column_name=prediction_probability_column_name,
+            s_zero_x_m=s_zero_x_m,
+            s_sign=s_sign,
+            interception_y_m=interception_y_m,
+            event_match_max_gap_sec=event_match_max_gap_sec,
+            prediction_y_offset_cm=prediction_y_offset_cm,
+            eef_y_offset_cm=eef_y_offset_cm,
+            annotate=False,
+        )
+        duration = max(0.0, episode.end_abs - episode.start_abs)
+        ax.set_title(f"Episode {episode.idx} ({duration:.2f} s)", fontsize=11, fontweight="bold")
+
+    for ax in axes.flat[n:]:
+        ax.axis("off")
+
+    handles: List[object] = []
+    labels: List[str] = []
+    for ax in axes.flat[:n]:
+        subplot_handles, subplot_labels = ax.get_legend_handles_labels()
+        for handle, label in zip(subplot_handles, subplot_labels):
+            if label not in labels:
+                handles.append(handle)
+                labels.append(label)
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.97),
+            ncol=min(4, len(labels)),
+            fontsize=8,
+        )
+
+    aggregate_stats = rollout_aggregate_statistics(episodes)
+    stats_text = rollout_overview_statistics_text(aggregate_stats)
+    fig.text(
+        0.81,
+        0.90,
+        stats_text,
+        ha="left",
+        va="top",
+        fontsize=9,
+        family="monospace",
+        bbox={
+            "boxstyle": "round,pad=0.5",
+            "facecolor": "white",
+            "edgecolor": "0.55",
+            "alpha": 0.94,
+        },
+        zorder=30,
+    )
+
+    log("[INFO] rollout aggregate statistics")
+    log(f"       |Executed - Rollout| [cm] min/mean/max (n={int(aggregate_stats['abs_executed_minus_rollout_m']['count'])}): "
+        f"{100.0 * aggregate_stats['abs_executed_minus_rollout_m']['min']:.1f} / "
+        f"{100.0 * aggregate_stats['abs_executed_minus_rollout_m']['mean']:.1f} / "
+        f"{100.0 * aggregate_stats['abs_executed_minus_rollout_m']['max']:.1f}")
+    log(f"       |Executed s| [cm] min/mean/max (n={int(aggregate_stats['abs_executed_from_middle_m']['count'])}): "
+        f"{100.0 * aggregate_stats['abs_executed_from_middle_m']['min']:.1f} / "
+        f"{100.0 * aggregate_stats['abs_executed_from_middle_m']['mean']:.1f} / "
+        f"{100.0 * aggregate_stats['abs_executed_from_middle_m']['max']:.1f}")
+    log(f"       Start->Scene [s] min/mean/max (n={int(aggregate_stats['start_to_scene_s']['count'])}): "
+        f"{aggregate_stats['start_to_scene_s']['min']:.2f} / "
+        f"{aggregate_stats['start_to_scene_s']['mean']:.2f} / "
+        f"{aggregate_stats['start_to_scene_s']['max']:.2f}")
+    log(f"       Start->Rollout [s] min/mean/max (n={int(aggregate_stats['start_to_rollout_s']['count'])}): "
+        f"{aggregate_stats['start_to_rollout_s']['min']:.2f} / "
+        f"{aggregate_stats['start_to_rollout_s']['mean']:.2f} / "
+        f"{aggregate_stats['start_to_rollout_s']['max']:.2f}")
+    log(f"       Scene->Rollout [s] min/mean/max (n={int(aggregate_stats['scene_to_rollout_s']['count'])}): "
+        f"{aggregate_stats['scene_to_rollout_s']['min']:.2f} / "
+        f"{aggregate_stats['scene_to_rollout_s']['mean']:.2f} / "
+        f"{aggregate_stats['scene_to_rollout_s']['max']:.2f}")
+    log(f"       Episode length [s] min/mean/max (n={int(aggregate_stats['episode_length_s']['count'])}): "
+        f"{aggregate_stats['episode_length_s']['min']:.2f} / "
+        f"{aggregate_stats['episode_length_s']['mean']:.2f} / "
+        f"{aggregate_stats['episode_length_s']['max']:.2f}")
+
+    fig.suptitle(
+        "Scene and Rollout interception analysis",
+        fontsize=15,
+        fontweight="bold",
+        y=0.996,
+    )
+    fig.tight_layout(rect=(0, 0.02, 0.80, 0.92))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    log(f"[INFO] wrote {output}")
+
+
+def plot_episode_rollout(
+    episode: EpisodeData,
+    output: Path,
+    table_bounds_cm: Tuple[float, float, float, float],
+    prediction_s_column_name: Optional[str],
+    prediction_probability_column_name: Optional[str],
+    s_zero_x_m: float,
+    s_sign: int,
+    interception_y_m: Optional[float],
+    event_match_max_gap_sec: float,
+    main_x_scale: float,
+    prediction_y_offset_cm: float,
+    eef_y_offset_cm: float,
+) -> None:
+    try:
+        fig = plt.figure(
+            figsize=(11.8, 7.8),
+            layout="compressed",
+        )
+    except TypeError:
+        fig = plt.figure(
+            figsize=(11.8, 7.8),
+            constrained_layout=True,
+        )
+
+    gs = fig.add_gridspec(
+        2,
+        2,
+        width_ratios=[1.28, 0.72],
+        height_ratios=[1.0, 1.0],
+        wspace=0.08,
+        hspace=0.16,
+    )
+    ax_xy = fig.add_subplot(gs[:, 0])
+    ax_s = fig.add_subplot(gs[0, 1])
+    ax_p = fig.add_subplot(gs[1, 1], sharex=ax_s)
+
+    draw_rollout_xy_panel(
+        ax_xy,
+        episode,
+        table_bounds_cm=table_bounds_cm,
+        prediction_s_column_name=prediction_s_column_name,
+        prediction_probability_column_name=prediction_probability_column_name,
+        s_zero_x_m=s_zero_x_m,
+        s_sign=s_sign,
+        interception_y_m=interception_y_m,
+        event_match_max_gap_sec=event_match_max_gap_sec,
+        prediction_y_offset_cm=prediction_y_offset_cm,
+        eef_y_offset_cm=eef_y_offset_cm,
+        annotate=True,
+    )
+    ax_xy.set_aspect(1.0 / float(main_x_scale), adjustable="box")
+
+    pred_t, pred_s, pred_p = extract_prediction_series(
+        episode,
+        prediction_s_column_name,
+        prediction_probability_column_name,
+    )
+    sic_event = selected_s_event_with_episode_time(episode.sic_selected_s, episode.start_abs)
+    ric_event = selected_s_event_with_episode_time(episode.ric_selected_s, episode.start_abs)
+    exec_event = first_executed_s_event(episode)
+
+    if len(pred_t) > 0:
+        ax_s.plot(pred_t, 100.0 * pred_s, color=ROLLOUT_PRIMARY, linewidth=1.8, label="ACT pred. s")
+        ax_p.plot(pred_t, pred_p, color=ROLLOUT_SECONDARY, linewidth=1.8, label="ACT exec. prob")
+
+    if sic_event is not None:
+        sic_t, sic_s = sic_event
+        ax_s.scatter([sic_t], [100.0 * sic_s], marker="^", s=70, color=SCENE_SECONDARY, label="Classic s")
+        ax_s.axvline(sic_t, color=SCENE_SECONDARY, linestyle="--", linewidth=1.1)
+        ax_p.axvline(sic_t, color=SCENE_SECONDARY, linestyle="--", linewidth=1.1)
+
+    ric_prob = None
+    if ric_event is not None:
+        ric_t, ric_s = ric_event
+        ax_s.scatter([ric_t], [100.0 * ric_s], marker="v", s=70, color=ROLLOUT_SECONDARY, label="ACT sel s")
+        ax_s.axvline(ric_t, color=ROLLOUT_SECONDARY, linestyle="--", linewidth=1.1)
+        ax_p.axvline(ric_t, color=ROLLOUT_SECONDARY, linestyle="--", linewidth=1.1)
+        if len(pred_t) > 0:
+            ric_prob = interpolate_1d(pred_t, pred_p, ric_t, event_match_max_gap_sec)
+            if ric_prob is not None:
+                ax_p.scatter(
+                    [ric_t],
+                    [ric_prob],
+                    marker="o",
+                    s=58,
+                    facecolors="white",
+                    edgecolors=ROLLOUT_SECONDARY,
+                    linewidths=1.8,
+                    label="ACT exec event",
+                    zorder=8,
+                )
+
+    if exec_event is not None:
+        exec_t, exec_s = exec_event
+        ax_s.scatter([exec_t], [100.0 * exec_s], marker="X", s=80, color=EXECUTION_COLOR, label="Actual exec. s")
+        ax_s.axvline(exec_t, color=EXECUTION_COLOR, linestyle=":", linewidth=1.2)
+        ax_p.axvline(exec_t, color=EXECUTION_COLOR, linestyle=":", linewidth=1.2, label="Actual . exec event")
+
+    ax_s.set_ylabel("s [cm]")
+    ax_s.set_title("Interception coordinate s(t)", fontsize=11)
+    ax_s.grid(True, alpha=0.3)
+
+    ax_p.set_xlabel("Episode time [s]")
+    ax_p.set_ylabel("Probability")
+    ax_p.set_title("Execute probability p(t)", fontsize=11)
+    ax_p.grid(True, alpha=0.3)
+    ax_p.set_ylim(-0.05, 1.05)
+
+    if len(pred_t) > 0:
+        ax_s.set_xlim(float(pred_t[0]), float(pred_t[-1]))
+
+    xy_handles, xy_labels = ax_xy.get_legend_handles_labels()
+    s_handles, s_labels = ax_s.get_legend_handles_labels()
+    p_handles, p_labels = ax_p.get_legend_handles_labels()
+
+    xy_requested = [
+        "Interception line",
+        "Ball trajectory",
+        "EEF trajectory",
+        "Rollout prediction evolution",
+        "Scene selected s",
+        "Rollout selected s",
+        "Actual executed s",
+        "Actual execution event",
+    ]
+    xy_legend_handles: List[object] = []
+    xy_legend_labels: List[str] = []
+    for requested in xy_requested:
+        for handle, label in zip(xy_handles, xy_labels):
+            matches = label.startswith("Interception line") if requested == "Interception line" else label == requested
+            if matches and requested not in xy_legend_labels:
+                xy_legend_handles.append(handle)
+                xy_legend_labels.append(requested)
+                break
+    if xy_legend_handles:
+        ax_xy.legend(
+            xy_legend_handles,
+            xy_legend_labels,
+            loc="lower left",
+            bbox_to_anchor=(0.02, 0.02),
+            bbox_transform=ax_xy.transAxes,
+            ncol=2,
+            fontsize=8,
+            framealpha=0.9,
+            facecolor="white",
+            edgecolor="0.75",
+        )
+
+    s_requested = [
+        "ACT pred. s",
+        "Classic s",
+        "ACT sel s",
+        "Actual exec. s",
+    ]
+    s_legend_handles: List[object] = []
+    s_legend_labels: List[str] = []
+    for requested in s_requested:
+        for handle, label in zip(s_handles, s_labels):
+            if label == requested and requested not in s_legend_labels:
+                s_legend_handles.append(handle)
+                s_legend_labels.append(requested)
+                break
+    if s_legend_handles:
+        ax_s.legend(s_legend_handles, s_legend_labels, loc="upper left", fontsize=8)
+
+    p_requested = [
+        "ACT exec. prob",
+        "ACT exec event",
+        "Actual . exec event",
+    ]
+    p_legend_handles: List[object] = []
+    p_legend_labels: List[str] = []
+    for requested in p_requested:
+        for handle, label in zip(p_handles, p_labels):
+            if label == requested and requested not in p_legend_labels:
+                p_legend_handles.append(handle)
+                p_legend_labels.append(requested)
+                break
+    if p_legend_handles:
+        ax_p.legend(p_legend_handles, p_legend_labels, loc="upper left", fontsize=8)
+
+    duration = max(0.0, episode.end_abs - episode.start_abs)
+    fig.suptitle(
+        f"Episode {episode.idx} rollout analysis ({duration:.2f} s)",
+        fontsize=14,
+        fontweight="bold",
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=220, bbox_inches="tight")
     plt.close(fig)
@@ -1274,7 +2340,23 @@ def plot_episode_detail(
     log(f"[INFO] wrote {output}")
 
 
-def write_episode_summary(episodes: Sequence[EpisodeData], output: Path) -> None:
+def write_episode_summary(
+    episodes: Sequence[EpisodeData],
+    output: Path,
+    prediction_s_column_name: Optional[str],
+    prediction_probability_column_name: Optional[str],
+    event_match_max_gap_sec: float,
+    s_zero_x_m: float,
+    s_sign: int,
+) -> None:
+    def coerce_float_or_nan(value: object) -> float:
+        if value is None:
+            return float("nan")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+
     rows: List[Dict[str, object]] = []
     for episode in episodes:
         row: Dict[str, object] = {
@@ -1282,6 +2364,7 @@ def write_episode_summary(episodes: Sequence[EpisodeData], output: Path) -> None
             "statistic": "",
             "episode_idx": episode.idx,
             "duration_s": episode.end_abs - episode.start_abs,
+            "episode_length_s": episode.end_abs - episode.start_abs,
             "ball_samples": len(episode.ball),
             "trajectory_samples": len(episode.trajectory),
             "goto_s_count": len(episode.goto_s),
@@ -1295,7 +2378,11 @@ def write_episode_summary(episodes: Sequence[EpisodeData], output: Path) -> None
                 .replace([np.inf, -np.inf], np.nan)
                 .dropna()
             )
-            times = relative_time(episode.goto_s, episode.start_abs).dropna()
+            times = (
+                relative_time(episode.goto_s, episode.start_abs)
+                .replace([np.inf, -np.inf], np.nan)
+                .dropna()
+            )
             row["executed_s_m"] = ";".join(f"{value:.6f}" for value in values)
             row["executed_s_time_s"] = ";".join(f"{value:.6f}" for value in times)
             row["executed_s_from_center_m"] = (
@@ -1307,32 +2394,36 @@ def write_episode_summary(episodes: Sequence[EpisodeData], output: Path) -> None
             row["executed_s_from_center_m"] = None
 
         row.update(episode_timing_metrics(episode))
+        row.update(
+            derive_rollout_metrics(
+                episode,
+                prediction_s_column_name=prediction_s_column_name,
+                prediction_probability_column_name=prediction_probability_column_name,
+                event_match_max_gap_sec=event_match_max_gap_sec,
+                s_zero_x_m=s_zero_x_m,
+                s_sign=s_sign,
+            )
+        )
+        row.update(rollout_episode_scalar_metrics(episode))
         rows.append(row)
 
     episode_rows = list(rows)
-    reducers = {
-        "min": np.min,
-        "max": np.max,
-        "mean": np.mean,
+    aggregate_stats = {
+        column: finite_stats([
+            coerce_float_or_nan(row.get(column, float("nan"))) for row in episode_rows
+        ])
+        for column in AGGREGATE_SUMMARY_COLUMNS
     }
-    for statistic, reducer in reducers.items():
+    for statistic in ("min", "mean", "max"):
         aggregate: Dict[str, object] = {
             "row_type": "summary_aggregate",
             "statistic": statistic,
             "episode_idx": "",
         }
         for column in AGGREGATE_SUMMARY_COLUMNS:
-            values = [
-                float(row[column])
-                for row in episode_rows
-                if row.get(column) is not None
-                and math.isfinite(float(row[column]))
-                and (
-                    column not in TIMING_SUMMARY_COLUMNS
-                    or float(row[column]) >= 0.0
-                )
-            ]
-            aggregate[column] = float(reducer(values)) if values else None
+            stats = aggregate_stats[column]
+            aggregate[column] = float(stats[statistic]) if stats["count"] > 0 else float("nan")
+            aggregate[f"{column}_count"] = int(stats["count"])
         rows.append(aggregate)
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1348,11 +2439,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, required=True, help="Directory for PNG plots and summary CSV.")
     parser.add_argument(
         "--plot-mode",
-        choices=("standard", "xy", "both"),
+        choices=("standard", "xy", "both", "rollout", "all"),
         default="standard",
         help=(
             "Plot family to generate: standard x/y-versus-time plots, top-down "
-            "table-frame XY overlays, or both. Default: standard."
+            "table-frame XY overlays, rollout analysis, legacy both (standard+xy), "
+            "or all (standard+xy+rollout). Default: standard."
         ),
     )
     parser.add_argument(
@@ -1385,24 +2477,112 @@ def parse_args() -> argparse.Namespace:
         metavar=("X_METERS", "Y_METERS"),
         default=(0.60, 1.20),
         help=(
-            "Physical table extent along table-frame x and y, in metres, used by "
-            "the XY overlay. The frame origin is the bottom-left table corner. "
-            "Default: 0.60 1.20."
+            "Physical table extent along table-frame x and y, in metres. "
+            "This does not define the XY displayed crop; use --table-x-min/max "
+            "and --table-y-min/max for display bounds. Default: 0.60 1.20."
         ),
     )
     parser.add_argument(
-        "--xy-table-y-max",
+        "--table_x_min",
+        "--table-x-min",
         type=float,
-        default=0.80,
+        default=0.0,
         help=(
-            "Upper table-frame y coordinate drawn by the XY overlay, in metres. "
-            "Trajectory points beyond it remain visible outside the table patch. "
-            "Default: 0.80."
+            "Displayed XY lower x bound in centimetres. Default: 0.0. "
+            "Alias: --table-x-min."
         ),
+    )
+    parser.add_argument(
+        "--table_x_max",
+        "--table-x-max",
+        type=float,
+        default=50.0,
+        help=(
+            "Displayed XY upper x bound in centimetres. Default: 60.0. "
+            "Alias: --table-x-max."
+        ),
+    )
+    parser.add_argument(
+        "--table_y_min",
+        "--table-y-min",
+        type=float,
+        default=10.0,
+        help=(
+            "Displayed XY lower y bound in centimetres. Default: 0.0. "
+            "Alias: --table-y-min."
+        ),
+    )
+    parser.add_argument(
+        "--table_y_max",
+        "--table-y-max",
+        type=float,
+        default=80.0,
+        help=(
+            "Displayed XY upper y bound in centimetres. Default: 80.0. "
+            "Alias: --table-y-max."
+        ),
+    )
+    parser.add_argument(
+        "--prediction-s-column",
+        type=str,
+        default=None,
+        help="Override ACT prediction s column name in /act/intercept_prediction CSV.",
+    )
+    parser.add_argument(
+        "--prediction-probability-column",
+        type=str,
+        default=None,
+        help="Override ACT prediction probability column name in /act/intercept_prediction CSV.",
+    )
+    parser.add_argument(
+        "--event-match-max-gap-sec",
+        type=float,
+        default=0.10,
+        help="Maximum interpolation bracket width for event-time matching. Default: 0.10 s.",
+    )
+    parser.add_argument(
+        "--s-zero-x-m",
+        type=float,
+        default=0.30,
+        help="Table x position mapped from s=0, in metres. Default: 0.30.",
+    )
+    parser.add_argument(
+        "--s-sign",
+        type=int,
+        choices=(-1, 1),
+        default=-1,
+        help="Sign for s-to-table-x mapping: x_table = s_zero_x_m + s_sign * s. Default: -1.",
+    )
+    parser.add_argument(
+        "--interception-y-m",
+        type=float,
+        default=None,
+        help="Override interception y level in table frame (metres) for rollout overlays.",
+    )
+    parser.add_argument(
+        "--rollout-main-x-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Visual x-direction scale factor for the main XY panel in per-episode "
+            "rollout plots only. Example: 1.5 stretches x by 1.5. Default: 1.0."
+        ),
+    )
+    parser.add_argument(
+        "--rollout-prediction-y-offset-cm",
+        type=float,
+        default=2.0,
+        help="Vertical offset above interception line for rollout prediction evolution, in cm. Default: 1.0.",
+    )
+    parser.add_argument(
+        "--rollout-eef-y-offset-cm",
+        type=float,
+        default=3.0,
+        help="Vertical offset above interception line for EEF trajectory in rollout plots, in cm. Default: 2.0.",
     )
 
     fk = parser.add_argument_group("optional TCP forward kinematics")
-    fk.add_argument("--urdf", type=Path, default=None, help="FR3 URDF used for Pinocchio FK.")
+    fk.add_argument("--urdf", type=Path, default="/home/jau/dyros/src/plotting/runtime_fr3.urdf", help="FR3 URDF used for Pinocchio FK.")
     fk.add_argument(
         "--tcp-frame",
         default="right_fr3_hand_tcp",
@@ -1432,13 +2612,33 @@ def main() -> None:
         raise ValueError("--overview-columns must be positive")
     if any(value <= 0.0 for value in args.table_size):
         raise ValueError("both --table-size values must be positive")
-    if args.xy_table_y_max <= 0.0:
-        raise ValueError("--xy-table-y-max must be positive")
+    if args.table_x_min >= args.table_x_max:
+        raise ValueError(
+            "invalid XY display bounds: --table-x-min/--table_x_min must be "
+            "less than --table-x-max/--table_x_max"
+        )
+    if args.table_y_min >= args.table_y_max:
+        raise ValueError(
+            "invalid XY display bounds: --table-y-min/--table_y_min must be "
+            "less than --table-y-max/--table_y_max"
+        )
     if args.urdf is not None and not args.urdf.exists():
         raise FileNotFoundError(f"URDF not found: {args.urdf}")
+    if args.event_match_max_gap_sec <= 0.0:
+        raise ValueError("--event-match-max-gap-sec must be positive")
+    if args.rollout_main_x_scale <= 0.0:
+        raise ValueError("--rollout-main-x-scale must be positive")
+
+    mapping_op = "+" if int(args.s_sign) >= 0 else "-"
+    log(f"[INFO] s-to-table mapping: x_table = {float(args.s_zero_x_m):.3f} {mapping_op} s")
 
     table_pose = parse_table_pose(args.table_pose_base)
     episodes = load_episodes(args.csv_dir, requested=args.episodes)
+    prediction_s_column_name, prediction_probability_column_name = resolve_prediction_columns_for_episodes(
+        episodes,
+        override_s_column=args.prediction_s_column,
+        override_probability_column=args.prediction_probability_column,
+    )
     add_tcp_and_transforms(
         episodes,
         urdf=args.urdf,
@@ -1447,7 +2647,11 @@ def main() -> None:
     )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    if args.plot_mode in {"standard", "both"}:
+    do_standard = args.plot_mode in {"standard", "both", "all"}
+    do_xy = args.plot_mode in {"xy", "both", "all"}
+    do_rollout = args.plot_mode in {"rollout", "all"}
+
+    if do_standard:
         plot_x_overview(
             episodes,
             args.out_dir / "interception_x_overview.png",
@@ -1463,16 +2667,18 @@ def main() -> None:
                     show_trajectory_estimate=not args.no_trajectory_estimate,
                 )
 
-    if args.plot_mode in {"xy", "both"}:
-        table_size_m = (
-            float(args.table_size[0]),
-            min(float(args.table_size[1]), float(args.xy_table_y_max)),
-        )
+    table_bounds_cm = (
+        float(args.table_x_min),
+        float(args.table_x_max),
+        float(args.table_y_min),
+        float(args.table_y_max),
+    )
+    if do_xy:
         plot_xy_overview(
             episodes,
             args.out_dir / "interception_xy_overview.png",
             columns=args.overview_columns,
-            table_size_m=table_size_m,
+            table_bounds_cm=table_bounds_cm,
         )
 
         if not args.no_detail_plots:
@@ -1480,10 +2686,51 @@ def main() -> None:
                 plot_episode_xy(
                     episode,
                     args.out_dir / f"episode_{episode.idx:02d}_xy.png",
-                    table_size_m=table_size_m,
+                    table_bounds_cm=table_bounds_cm,
                 )
 
-    write_episode_summary(episodes, args.out_dir / "episode_summary.csv")
+    if do_rollout:
+        plot_rollout_overview(
+            episodes,
+            args.out_dir / "interception_rollout_overview.png",
+            columns=args.overview_columns,
+            table_bounds_cm=table_bounds_cm,
+            prediction_s_column_name=prediction_s_column_name,
+            prediction_probability_column_name=prediction_probability_column_name,
+            s_zero_x_m=float(args.s_zero_x_m),
+            s_sign=int(args.s_sign),
+            interception_y_m=args.interception_y_m,
+            event_match_max_gap_sec=float(args.event_match_max_gap_sec),
+            prediction_y_offset_cm=float(args.rollout_prediction_y_offset_cm),
+            eef_y_offset_cm=float(args.rollout_eef_y_offset_cm),
+        )
+
+        if not args.no_detail_plots:
+            for episode in episodes:
+                plot_episode_rollout(
+                    episode,
+                    args.out_dir / f"episode_{episode.idx:02d}_rollout.png",
+                    table_bounds_cm=table_bounds_cm,
+                    prediction_s_column_name=prediction_s_column_name,
+                    prediction_probability_column_name=prediction_probability_column_name,
+                    s_zero_x_m=float(args.s_zero_x_m),
+                    s_sign=int(args.s_sign),
+                    interception_y_m=args.interception_y_m,
+                    event_match_max_gap_sec=float(args.event_match_max_gap_sec),
+                    main_x_scale=float(args.rollout_main_x_scale),
+                    prediction_y_offset_cm=float(args.rollout_prediction_y_offset_cm),
+                    eef_y_offset_cm=float(args.rollout_eef_y_offset_cm),
+                )
+
+    write_episode_summary(
+        episodes,
+        args.out_dir / "episode_summary.csv",
+        prediction_s_column_name=prediction_s_column_name,
+        prediction_probability_column_name=prediction_probability_column_name,
+        event_match_max_gap_sec=float(args.event_match_max_gap_sec),
+        s_zero_x_m=float(args.s_zero_x_m),
+        s_sign=int(args.s_sign),
+    )
 
     log("")
     log("[INFO] done")
