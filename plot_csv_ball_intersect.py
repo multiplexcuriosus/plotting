@@ -2,62 +2,52 @@
 """
 Plot ball-interception episodes exported by bag_to_csv.py.
 
-Designed for the current MVP bag topics:
-  /scene_localizer/top_cam/ball_3d_table
-  /scene/ball_trajectory_table
-  /trajectory_executor/executed_goto_s
-  /trajectory_executor/executed_goto_s_target_base
-  /joint_states
+Plot modes:
+    - standard: time plots
+    - xy: top-down table-frame XY plots
+    - both: standard + xy
+    - cont_tracker: continuous tracker analysis only
+    - all: standard + xy + continuous tracker
 
-Default output:
-  1. interception_x_overview.png
-       One subplot per episode, showing ball x in table coordinates and the
-       time at which executed_goto_s was published.
+Rollout analysis is independent and fully opt-in with --include-rollout.
 
-  2. episode_XX_detail.png
-       Detailed x/y plots plus execution information for every episode.
-
-XY table-overlay output:
-  Select --plot-mode xy to draw a top-down view of the table frame with the
-  ball/TCP XY paths, path directions, and executed interception target
-  overlaid. Select --plot-mode both to create the standard and XY plots:
-    interception_xy_overview.png
-    episode_XX_xy.png
-  The table-frame origin is the bottom-left corner; the table extends along
-    positive x and positive y. The displayed XY rectangle is configurable in
-    centimetres using --table-x-min/--table_x_min, --table-x-max/--table_x_max,
-    --table-y-min/--table_y_min, and --table-y-max/--table_y_max. Defaults:
-    x in [0, 60] cm, y in [0, 80] cm.
-
-Optional TCP support:
-  Supply --urdf and --tcp-frame to calculate TCP position from /joint_states
-  with Pinocchio. Supply --table-pose-base TX TY TZ QX QY QZ QW to transform
-  TCP and executed target points from robot-base coordinates into table
-  coordinates and overlay them with the ball.
-
-Typical use:
-  python3 plot_csv_ball_intersect_mvp.py \
-      --csv-dir /home/jau/data/bags/recording_20260716_161544/csv \
-      --out-dir /home/jau/data/bags/recording_20260716_161544/plots
-
-With FK and table pose:
-  python3 plot_csv_ball_intersect_mvp.py \
-      --csv-dir /path/to/csv \
-      --out-dir /path/to/plots \
-      --urdf /path/to/fr3.urdf \
-      --tcp-frame right_fr3_hand_tcp \
-      --table-pose-base TX TY TZ QX QY QZ QW
-
-Example XY crop in table-frame centimetres:
-    python3 plot_csv_ball_intersect_mvp.py \
+Examples:
+    # Continuous tracker only; no rollout CSVs required
+    python3 plot_csv_ball_intersect.py \
             --csv-dir /path/to/csv \
             --out-dir /path/to/plots \
-            --plot-mode xy \
-            --table-x-min 10 --table-x-max 50 \
-            --table-y-min 10 --table-y-max 70
+            --plot-mode cont_tracker
+
+    # Existing plots plus continuous tracker
+    python3 plot_csv_ball_intersect.py \
+            --csv-dir /path/to/csv \
+            --out-dir /path/to/plots \
+            --plot-mode all
+
+    # Explicitly add rollout analysis
+    python3 plot_csv_ball_intersect.py \
+            --csv-dir /path/to/csv \
+            --out-dir /path/to/plots \
+            --plot-mode all \
+            --include-rollout
+
+        # Continuous tracker with explicit update-line rendering mode
+        python3 plot_csv_ball_intersect.py \
+            --csv-dir /path/to/csv \
+            --out-dir /path/to/plots \
+            --urdf /path/to/runtime_fr3.urdf \
+            --plot-mode cont_tracker \
+            --cont-track-update-lines all
+
+        # Suppress dense update lines, keep only first GOTO_S command line
+        python3 plot_csv_ball_intersect.py \
+            --csv-dir /path/to/csv \
+            --out-dir /path/to/plots \
+            --plot-mode cont_tracker \
+            --cont-track-update-lines none
 
 The seven --table-pose-base values describe the table frame pose in robot base:
-  [translation xyz, quaternion xyzw] = T_base_table
+    [translation xyz, quaternion xyzw] = T_base_table
 """
 
 from __future__ import annotations
@@ -83,16 +73,24 @@ EXECUTION_COLOR = "#7b1fa2"     # purple
 NEUTRAL_COLOR = "#555555"
 
 
-TOPICS = {
+_CONT_GOTO_FALLBACK_WARNED_EPISODES: set[int] = set()
+
+
+CORE_TOPICS = {
     "ball": "/scene_localizer/top_cam/ball_3d_table",
     "trajectory": "/scene/ball_trajectory_table",
     "goto_s": "/trajectory_executor/executed_goto_s",
     "goto_target_base": "/trajectory_executor/executed_goto_s_target_base",
     "joints": "/joint_states",
+}
+
+ROLLOUT_TOPICS = {
     "act_prediction": "/act/intercept_prediction",
     "sic_selected_s": "/interception_controller/selected_goto_s",
     "ric_selected_s": "/rollout_interception_controller/selected_goto_s",
 }
+
+DEFAULT_CONT_TRACK_TOPIC = "/cont_tracker/track_s"
 
 ARM_JOINTS = [f"right_fr3_joint{i}" for i in range(1, 8)]
 
@@ -106,6 +104,9 @@ AGGREGATE_SUMMARY_COLUMNS = (
     *TIMING_SUMMARY_COLUMNS,
     "executed_s_from_center_m",
     "duration_s",
+)
+
+ROLLOUT_SUMMARY_COLUMNS = (
     "prediction_count",
     "prediction_s_min_m",
     "prediction_s_mean_m",
@@ -127,6 +128,16 @@ AGGREGATE_SUMMARY_COLUMNS = (
     "start_to_rollout_s",
     "scene_to_rollout_s",
     "episode_length_s",
+)
+
+CONT_TRACKER_SUMMARY_COLUMNS = (
+    "cont_tracking_sample_count",
+    "cont_target_update_count",
+    "cont_error_mean_m",
+    "cont_error_mae_m",
+    "cont_error_rmse_m",
+    "cont_error_p95_abs_m",
+    "cont_error_max_abs_m",
 )
 
 # Default T_base_table = [tx, ty, tz, qx, qy, qz, qw]
@@ -166,6 +177,7 @@ class EpisodeData:
     act_prediction: pd.DataFrame
     sic_selected_s: pd.DataFrame
     ric_selected_s: pd.DataFrame
+    track_s: pd.DataFrame
     tcp_base: Optional[pd.DataFrame] = None
     tcp_table: Optional[pd.DataFrame] = None
     goto_target_table: Optional[pd.DataFrame] = None
@@ -179,15 +191,23 @@ def topic_to_filename(topic: str) -> str:
     return topic.strip("/").replace("/", "__") + ".csv"
 
 
-def read_optional_csv(csv_dir: Path, topic: str) -> pd.DataFrame:
+def read_optional_csv(
+    csv_dir: Path,
+    topic: str,
+    *,
+    warn_missing: bool = True,
+    warn_empty: bool = True,
+) -> pd.DataFrame:
     path = csv_dir / topic_to_filename(topic)
     if not path.exists():
-        log(f"[WARNING] missing optional CSV: {path.name}")
+        if warn_missing:
+            log(f"[WARNING] missing optional CSV: {path.name}")
         return pd.DataFrame()
 
     df = pd.read_csv(path)
     if df.empty:
-        log(f"[WARNING] empty CSV: {path.name}")
+        if warn_empty:
+            log(f"[WARNING] empty CSV: {path.name}")
         return pd.DataFrame()
 
     for col in ["t_abs", "t_rel", "t_episode", "episode_idx", "header_stamp"]:
@@ -332,20 +352,113 @@ def relative_time(df: pd.DataFrame, episode_start_abs: float) -> pd.Series:
     raise RuntimeError("CSV has neither t_abs nor t_episode")
 
 
-def load_episodes(csv_dir: Path, requested: Optional[Sequence[int]]) -> List[EpisodeData]:
-    frames: Dict[str, pd.DataFrame] = {
-        key: read_optional_csv(csv_dir, topic) for key, topic in TOPICS.items()
-    }
+def load_episodes(
+    csv_dir: Path,
+    requested: Optional[Sequence[int]],
+    *,
+    require_ball: bool,
+    include_rollout: bool,
+    enable_cont_tracker: bool,
+    require_cont_trajectory: bool,
+    cont_track_topic: str,
+) -> List[EpisodeData]:
+    frames: Dict[str, pd.DataFrame] = {}
 
-    ball = frames["ball"]
-    if ball.empty:
+    need_ball = bool(require_ball or enable_cont_tracker)
+    need_trajectory = bool(require_ball or (enable_cont_tracker and require_cont_trajectory))
+    need_goto_executor_topics = bool(require_ball)
+
+    frames["joints"] = read_optional_csv(csv_dir, CORE_TOPICS["joints"])
+
+    if need_ball:
+        frames["ball"] = read_optional_csv(csv_dir, CORE_TOPICS["ball"])
+    else:
+        frames["ball"] = pd.DataFrame()
+
+    if need_trajectory:
+        frames["trajectory"] = read_optional_csv(csv_dir, CORE_TOPICS["trajectory"])
+    else:
+        frames["trajectory"] = pd.DataFrame()
+
+    if need_goto_executor_topics:
+        frames["goto_s"] = read_optional_csv(csv_dir, CORE_TOPICS["goto_s"])
+        frames["goto_target_base"] = read_optional_csv(csv_dir, CORE_TOPICS["goto_target_base"])
+    else:
+        frames["goto_s"] = pd.DataFrame()
+        frames["goto_target_base"] = pd.DataFrame()
+
+    if include_rollout:
+        frames["act_prediction"] = read_optional_csv(csv_dir, ROLLOUT_TOPICS["act_prediction"])
+        frames["sic_selected_s"] = read_optional_csv(csv_dir, ROLLOUT_TOPICS["sic_selected_s"])
+        frames["ric_selected_s"] = read_optional_csv(csv_dir, ROLLOUT_TOPICS["ric_selected_s"])
+    elif enable_cont_tracker:
+        # Continuous-tracker uses SIC timing for first command, but this must not activate rollout processing.
+        frames["act_prediction"] = pd.DataFrame()
+        frames["ric_selected_s"] = pd.DataFrame()
+        frames["sic_selected_s"] = read_optional_csv(
+            csv_dir,
+            ROLLOUT_TOPICS["sic_selected_s"],
+            warn_missing=False,
+            warn_empty=False,
+        )
+    else:
+        frames["act_prediction"] = pd.DataFrame()
+        frames["sic_selected_s"] = pd.DataFrame()
+        frames["ric_selected_s"] = pd.DataFrame()
+
+    if enable_cont_tracker:
+        track_df = read_optional_csv(csv_dir, cont_track_topic, warn_missing=False, warn_empty=False)
+        if track_df.empty:
+            expected_name = topic_to_filename(cont_track_topic)
+            raise RuntimeError(
+                "Continuous-tracker mode requires non-empty tracking goal data. "
+                f"Expected topic {cont_track_topic!r} in CSV {expected_name!r}. "
+                "Ensure the topic is recorded and exported with bag_to_csv.py."
+            )
+        frames["track_s"] = track_df
+    else:
+        frames["track_s"] = pd.DataFrame()
+
+    if need_ball:
+        ball = frames["ball"]
+        if ball.empty:
+            raise RuntimeError(
+                f"Required ball CSV not found: {topic_to_filename(CORE_TOPICS['ball'])}. "
+                "Export it with bag_to_csv.py first."
+            )
+        require_columns(ball, ["point_x", "point_y"], "ball")
+
+    if need_trajectory and frames["trajectory"].empty:
         raise RuntimeError(
-            f"Required ball CSV not found: {topic_to_filename(TOPICS['ball'])}. "
+            f"Required trajectory CSV not found: {topic_to_filename(CORE_TOPICS['trajectory'])}. "
             "Export it with bag_to_csv.py first."
         )
-    require_columns(ball, ["point_x", "point_y"], "ball")
 
-    available = episode_indices(frames.values())
+    if frames["joints"].empty:
+        raise RuntimeError(
+            f"Required joint_states CSV not found: {topic_to_filename(CORE_TOPICS['joints'])}. "
+            "Export it with bag_to_csv.py first."
+        )
+
+    available_sources: List[pd.DataFrame] = [frames["joints"]]
+    if need_ball:
+        available_sources.extend(
+            [
+                frames["ball"],
+            ]
+        )
+    if need_trajectory:
+        available_sources.append(frames["trajectory"])
+    if need_goto_executor_topics:
+        available_sources.extend([frames["goto_s"], frames["goto_target_base"]])
+    if enable_cont_tracker:
+        available_sources.append(frames["track_s"])
+    if include_rollout:
+        available_sources.extend(
+            [frames["act_prediction"], frames["sic_selected_s"], frames["ric_selected_s"]]
+        )
+
+    available = episode_indices(available_sources)
     if not available:
         raise RuntimeError(
             "No episode_idx columns found. Re-run bag_to_csv.py with --use_episode_windows."
@@ -362,20 +475,33 @@ def load_episodes(csv_dir: Path, requested: Optional[Sequence[int]]) -> List[Epi
     episodes: List[EpisodeData] = []
     for idx in selected:
         episode_parts = {key: select_episode(df, idx) for key, df in frames.items()}
-        start_abs, end_abs = infer_episode_bounds(list(episode_parts.values()))
+        start_abs, end_abs = infer_episode_bounds(
+            [
+                episode_parts["joints"],
+                episode_parts.get("ball", pd.DataFrame()),
+                episode_parts.get("trajectory", pd.DataFrame()),
+                episode_parts.get("goto_s", pd.DataFrame()),
+                episode_parts.get("goto_target_base", pd.DataFrame()),
+                episode_parts.get("track_s", pd.DataFrame()),
+                episode_parts.get("act_prediction", pd.DataFrame()),
+                episode_parts.get("sic_selected_s", pd.DataFrame()),
+                episode_parts.get("ric_selected_s", pd.DataFrame()),
+            ]
+        )
         episodes.append(
             EpisodeData(
                 idx=idx,
                 start_abs=start_abs,
                 end_abs=end_abs,
-                ball=episode_parts["ball"],
-                trajectory=episode_parts["trajectory"],
-                goto_s=episode_parts["goto_s"],
-                goto_target_base=episode_parts["goto_target_base"],
+                ball=episode_parts.get("ball", pd.DataFrame()),
+                trajectory=episode_parts.get("trajectory", pd.DataFrame()),
+                goto_s=episode_parts.get("goto_s", pd.DataFrame()),
+                goto_target_base=episode_parts.get("goto_target_base", pd.DataFrame()),
                 joints=episode_parts["joints"],
-                act_prediction=episode_parts["act_prediction"],
-                sic_selected_s=episode_parts["sic_selected_s"],
-                ric_selected_s=episode_parts["ric_selected_s"],
+                act_prediction=episode_parts.get("act_prediction", pd.DataFrame()),
+                sic_selected_s=episode_parts.get("sic_selected_s", pd.DataFrame()),
+                ric_selected_s=episode_parts.get("ric_selected_s", pd.DataFrame()),
+                track_s=episode_parts.get("track_s", pd.DataFrame()),
             )
         )
 
@@ -549,6 +675,8 @@ def trajectory_intercept_x_column(df: pd.DataFrame) -> Optional[str]:
     exact = first_existing_column(
         df,
         [
+            "end_point_x",
+            "start_point_x",
             "intersection_point_x",
             "intercept_point_x",
             "predicted_intersection_x",
@@ -568,6 +696,12 @@ def trajectory_intercept_x_column(df: pd.DataFrame) -> Optional[str]:
         )
         if found:
             return found
+
+    # Some trajectory exporters publish line endpoints instead of explicit
+    # "intersection" fields; prefer end_point_x as the forward estimate.
+    endpoint = first_existing_column(df, ["end_point_x", "start_point_x"])
+    if endpoint is not None:
+        return endpoint
     return None
 
 
@@ -737,6 +871,66 @@ def map_s_to_table_x_m(
     s_sign: int,
 ) -> np.ndarray:
     return float(s_zero_x_m) + float(s_sign) * np.asarray(s_m, dtype=float)
+
+
+def map_table_x_to_s_m(
+    x_table_m: np.ndarray,
+    s_zero_x_m: float,
+    s_sign: int,
+) -> np.ndarray:
+    return (np.asarray(x_table_m, dtype=float) - float(s_zero_x_m)) / float(s_sign)
+
+
+def extend_held_step_to_episode_end(
+    times: np.ndarray,
+    values: np.ndarray,
+    episode_duration_s: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    t = np.asarray(times, dtype=float)
+    v = np.asarray(values, dtype=float)
+    if t.size == 0 or v.size == 0:
+        return t, v
+    if float(t[-1]) < float(episode_duration_s):
+        t = np.append(t, float(episode_duration_s))
+        v = np.append(v, float(v[-1]))
+    return t, v
+
+
+def draw_cont_tracker_timing_markers(
+    ax,
+    *,
+    first_goto_t_rel: float,
+    all_update_t_rel: np.ndarray,
+    changed_update_t_rel: np.ndarray,
+    update_line_mode: str,
+) -> None:
+    ax.axvline(
+        float(first_goto_t_rel),
+        color=SCENE_SECONDARY,
+        linestyle="--",
+        linewidth=1.3,
+        alpha=0.9,
+        label="First GOTO_S command",
+        zorder=3,
+    )
+
+    if update_line_mode == "none":
+        return
+    update_times = all_update_t_rel if update_line_mode == "all" else changed_update_t_rel
+    if update_times.size == 0:
+        return
+
+    labeled = False
+    for value in update_times:
+        ax.axvline(
+            float(value),
+            color=NEUTRAL_COLOR,
+            linewidth=0.5,
+            alpha=0.10,
+            label=("track_s update" if not labeled else None),
+            zorder=2,
+        )
+        labeled = True
 
 
 def extract_prediction_series(
@@ -2340,6 +2534,519 @@ def plot_episode_detail(
     log(f"[INFO] wrote {output}")
 
 
+def resolve_track_s_column(df: pd.DataFrame, override: Optional[str]) -> str:
+    if df.empty:
+        raise RuntimeError("continuous tracker CSV is empty")
+
+    if override is not None:
+        if override not in df.columns:
+            raise RuntimeError(
+                f"--track-s-column={override!r} not found. "
+                f"Available columns: {list(df.columns)}"
+            )
+        return override
+
+    for candidate in ("track_s", "target_s", "data", "s"):
+        if candidate in df.columns:
+            return candidate
+
+    fuzzy_candidates: List[str] = []
+    for col in df.columns:
+        lower = col.lower()
+        if "track" not in lower or "s" not in lower:
+            continue
+        if pd.to_numeric(df[col], errors="coerce").notna().any():
+            fuzzy_candidates.append(col)
+
+    if len(fuzzy_candidates) == 1:
+        return fuzzy_candidates[0]
+
+    raise RuntimeError(
+        "Unable to resolve continuous tracking goal column. "
+        f"Available columns: {list(df.columns)}. "
+        "Pass --track-s-column explicitly."
+    )
+
+
+def compute_cont_target_updates(target_s_m: np.ndarray, eps_m: float) -> np.ndarray:
+    if target_s_m.size == 0:
+        return np.zeros(0, dtype=bool)
+    keep = np.zeros(target_s_m.size, dtype=bool)
+    keep[0] = True
+    last_kept = float(target_s_m[0])
+    for idx in range(1, target_s_m.size):
+        value = float(target_s_m[idx])
+        if abs(value - last_kept) >= float(eps_m):
+            keep[idx] = True
+            last_kept = value
+    return keep
+
+
+def prepare_cont_tracker_episode_data(
+    episode: EpisodeData,
+    track_s_column: str,
+    *,
+    s_zero_x_m: float,
+    s_sign: int,
+    target_change_eps_m: float,
+    include_trajectory_estimate: bool,
+) -> Dict[str, object]:
+    if episode.track_s.empty:
+        raise RuntimeError(f"episode {episode.idx}: missing continuous tracker data")
+    if episode.tcp_table is None or episode.tcp_table.empty or "x_table" not in episode.tcp_table.columns:
+        raise RuntimeError(
+            "Continuous-tracker analysis requires usable TCP table-frame data. "
+            "Provide a usable --urdf, --tcp-frame, and valid table pose so FK and base->table transform succeed."
+        )
+    if "t_abs" not in episode.track_s.columns:
+        raise RuntimeError(f"episode {episode.idx}: continuous tracker CSV requires t_abs")
+    if "t_abs" not in episode.tcp_table.columns:
+        raise RuntimeError(f"episode {episode.idx}: TCP table-frame data requires t_abs")
+
+    targets_raw = pd.DataFrame(
+        {
+            "t_abs": numeric(episode.track_s, "t_abs"),
+            "s": numeric(episode.track_s, track_s_column),
+            "_order": np.arange(len(episode.track_s), dtype=int),
+        }
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    targets_raw = targets_raw.sort_values(["t_abs", "_order"])
+
+    if targets_raw.empty:
+        raise RuntimeError(f"episode {episode.idx}: no valid track_s samples after numeric cleaning")
+
+    # Keep the last sample in input order for duplicate timestamps for ZOH alignment.
+    targets = targets_raw.drop_duplicates(subset=["t_abs"], keep="last")
+
+    eef = pd.DataFrame(
+        {
+            "t_abs": numeric(episode.tcp_table, "t_abs"),
+            "x_table": numeric(episode.tcp_table, "x_table"),
+        }
+    ).replace([np.inf, -np.inf], np.nan).dropna().sort_values("t_abs")
+
+    if eef.empty:
+        raise RuntimeError(
+            f"episode {episode.idx}: no valid TCP table-frame samples from FK/table transform"
+        )
+
+    eef["s"] = map_table_x_to_s_m(eef["x_table"].to_numpy(dtype=float), s_zero_x_m, s_sign)
+
+    target_t_abs = targets["t_abs"].to_numpy(dtype=float)
+    target_s = targets["s"].to_numpy(dtype=float)
+    target_raw_t_abs = targets_raw["t_abs"].to_numpy(dtype=float)
+    target_raw_s = targets_raw["s"].to_numpy(dtype=float)
+    eef_t_abs = eef["t_abs"].to_numpy(dtype=float)
+    eef_s = eef["s"].to_numpy(dtype=float)
+
+    # Zero-order hold starts only after the first target sample.
+    valid_eef_mask = eef_t_abs >= float(target_t_abs[0])
+    eef_t_abs = eef_t_abs[valid_eef_mask]
+    eef_s = eef_s[valid_eef_mask]
+
+    held_s = np.array([], dtype=float)
+    error_m = np.array([], dtype=float)
+    if eef_t_abs.size > 0:
+        held_indices = np.searchsorted(target_t_abs, eef_t_abs, side="right") - 1
+        valid_idx = held_indices >= 0
+        held_indices = held_indices[valid_idx]
+        eef_t_abs = eef_t_abs[valid_idx]
+        eef_s = eef_s[valid_idx]
+        held_s = target_s[held_indices]
+        error_m = eef_s - held_s
+
+    finite_mask = np.isfinite(eef_t_abs) & np.isfinite(eef_s) & np.isfinite(held_s) & np.isfinite(error_m)
+    eef_t_abs = eef_t_abs[finite_mask]
+    eef_s = eef_s[finite_mask]
+    held_s = held_s[finite_mask]
+    error_m = error_m[finite_mask]
+
+    update_keep = compute_cont_target_updates(target_s, eps_m=target_change_eps_m)
+
+    abs_err = np.abs(error_m)
+    metrics = {
+        "cont_tracking_sample_count": int(error_m.size),
+        "cont_target_update_count": int(np.count_nonzero(update_keep)),
+        "cont_error_mean_m": float(np.mean(error_m)) if error_m.size else float("nan"),
+        "cont_error_mae_m": float(np.mean(abs_err)) if error_m.size else float("nan"),
+        "cont_error_rmse_m": float(np.sqrt(np.mean(error_m ** 2))) if error_m.size else float("nan"),
+        "cont_error_p95_abs_m": float(np.percentile(abs_err, 95.0)) if error_m.size else float("nan"),
+        "cont_error_max_abs_m": float(np.max(abs_err)) if error_m.size else float("nan"),
+    }
+
+    first_target_t_abs = float(target_raw_t_abs[0])
+    first_target_s_m = float(target_raw_s[0])
+    sic_event = selected_s_event_with_episode_time(episode.sic_selected_s, episode.start_abs)
+    if sic_event is not None:
+        first_goto_t_rel = float(sic_event[0])
+        first_goto_s_m = float(sic_event[1])
+    else:
+        first_goto_t_rel = float(first_target_t_abs - episode.start_abs)
+        first_goto_s_m = first_target_s_m
+        if episode.idx not in _CONT_GOTO_FALLBACK_WARNED_EPISODES:
+            log(
+                f"[WARNING] episode {episode.idx}: missing {ROLLOUT_TOPICS['sic_selected_s']} first command; "
+                "falling back to first valid track_s sample timestamp."
+            )
+            _CONT_GOTO_FALLBACK_WARNED_EPISODES.add(episode.idx)
+
+    changed_update_t_rel = (target_t_abs - float(episode.start_abs))[update_keep]
+    if changed_update_t_rel.size > 0:
+        changed_update_t_rel = changed_update_t_rel[1:]
+
+    all_update_t_rel = target_raw_t_abs - float(episode.start_abs)
+    if all_update_t_rel.size > 0:
+        all_update_t_rel = all_update_t_rel[1:]
+
+    trajectory_t_rel = np.array([], dtype=float)
+    trajectory_estimation_s_m = np.array([], dtype=float)
+    if include_trajectory_estimate:
+        x_col = trajectory_intercept_x_column(episode.trajectory)
+        if x_col is None:
+            log(
+                f"[WARNING] episode {episode.idx}: could not resolve trajectory intercept x column in "
+                f"{topic_to_filename(CORE_TOPICS['trajectory'])}; skipping trajectory-estimated "
+                "interception overlay for this episode."
+            )
+        else:
+            traj = pd.DataFrame(
+                {
+                    "t_abs": numeric(episode.trajectory, "t_abs"),
+                    "x_table": numeric(episode.trajectory, x_col),
+                }
+            ).replace([np.inf, -np.inf], np.nan).dropna().sort_values("t_abs")
+            if traj.empty:
+                log(
+                    f"[WARNING] episode {episode.idx}: no valid trajectory intercept samples in "
+                    f"{topic_to_filename(CORE_TOPICS['trajectory'])}; skipping trajectory-estimated "
+                    "interception overlay for this episode."
+                )
+            else:
+                trajectory_t_rel = traj["t_abs"].to_numpy(dtype=float) - float(episode.start_abs)
+                trajectory_estimation_s_m = map_table_x_to_s_m(
+                    traj["x_table"].to_numpy(dtype=float),
+                    s_zero_x_m,
+                    s_sign,
+                )
+
+    ball_x_m, ball_y_m, ball_t_rel = finite_xy_time(
+        episode.ball,
+        episode.start_abs,
+        "point_x",
+        "point_y",
+    )
+    if ball_t_rel.size == 0:
+        raise RuntimeError(
+            f"episode {episode.idx}: no valid ball samples in {topic_to_filename(CORE_TOPICS['ball'])}"
+        )
+    ball_s_m = map_table_x_to_s_m(ball_x_m, s_zero_x_m, s_sign)
+    max_y_index = int(np.argmax(ball_y_m))
+    ball_max_y_t_rel = float(ball_t_rel[max_y_index])
+    ball_max_y_s_m = float(ball_s_m[max_y_index])
+    ball_max_y_m = float(ball_y_m[max_y_index])
+
+    episode_duration_s = max(0.0, float(episode.end_abs - episode.start_abs))
+    target_t_rel = target_t_abs - float(episode.start_abs)
+    target_plot_t_rel, target_plot_s_m = extend_held_step_to_episode_end(
+        target_t_rel,
+        target_s,
+        episode_duration_s,
+    )
+
+    return {
+        "target_t_rel": target_t_rel,
+        "target_s_m": target_s,
+        "target_plot_t_rel": target_plot_t_rel,
+        "target_plot_s_m": target_plot_s_m,
+        "eef_t_rel": eef_t_abs - float(episode.start_abs),
+        "eef_s_m": eef_s,
+        "held_s_m": held_s,
+        "error_m": error_m,
+        "first_goto_t_rel": first_goto_t_rel,
+        "first_goto_s_m": first_goto_s_m,
+        "all_update_t_rel": np.asarray(all_update_t_rel, dtype=float),
+        "changed_update_t_rel": np.asarray(changed_update_t_rel, dtype=float),
+        "trajectory_t_rel": np.asarray(trajectory_t_rel, dtype=float),
+        "trajectory_estimation_s_m": np.asarray(trajectory_estimation_s_m, dtype=float),
+        "ball_t_rel": np.asarray(ball_t_rel, dtype=float),
+        "ball_s_m": np.asarray(ball_s_m, dtype=float),
+        "ball_y_m": np.asarray(ball_y_m, dtype=float),
+        "ball_max_y_t_rel": ball_max_y_t_rel,
+        "ball_max_y_s_m": ball_max_y_s_m,
+        "ball_max_y_m": ball_max_y_m,
+        "episode_duration_s": episode_duration_s,
+        "metrics": metrics,
+    }
+
+
+def _format_cont_metric_cm(value_m: float) -> str:
+    if not math.isfinite(float(value_m)):
+        return "n/a"
+    return f"{100.0 * float(value_m):.2f} cm"
+
+
+def plot_cont_tracker_overview(
+    episodes: Sequence[EpisodeData],
+    output: Path,
+    columns: int,
+    *,
+    track_s_column: str,
+    s_zero_x_m: float,
+    s_sign: int,
+    target_change_eps_m: float,
+    include_trajectory_estimate: bool,
+    update_line_mode: str,
+) -> None:
+    n = len(episodes)
+    rows = math.ceil(n / columns)
+    fig, axes = plt.subplots(
+        rows,
+        columns,
+        figsize=(5.5 * columns, 3.3 * rows),
+        squeeze=False,
+        sharex=False,
+    )
+
+    for ax, episode in zip(axes.flat, episodes):
+        prepared = prepare_cont_tracker_episode_data(
+            episode,
+            track_s_column,
+            s_zero_x_m=s_zero_x_m,
+            s_sign=s_sign,
+            target_change_eps_m=target_change_eps_m,
+            include_trajectory_estimate=include_trajectory_estimate,
+        )
+        target_t = np.asarray(prepared["target_plot_t_rel"], dtype=float)
+        target_s_cm = 100.0 * np.asarray(prepared["target_plot_s_m"], dtype=float)
+        eef_t = np.asarray(prepared["eef_t_rel"], dtype=float)
+        eef_s_cm = 100.0 * np.asarray(prepared["eef_s_m"], dtype=float)
+        traj_t = np.asarray(prepared["trajectory_t_rel"], dtype=float)
+        traj_s_cm = 100.0 * np.asarray(prepared["trajectory_estimation_s_m"], dtype=float)
+        ball_t = np.asarray(prepared["ball_t_rel"], dtype=float)
+        ball_s_cm = 100.0 * np.asarray(prepared["ball_s_m"], dtype=float)
+        all_update_t = np.asarray(prepared["all_update_t_rel"], dtype=float)
+        changed_update_t = np.asarray(prepared["changed_update_t_rel"], dtype=float)
+        first_goto_t = float(prepared["first_goto_t_rel"])
+        ball_max_y_t = float(prepared["ball_max_y_t_rel"])
+        ball_max_y_s_cm = 100.0 * float(prepared["ball_max_y_s_m"])
+        episode_duration_s = float(prepared["episode_duration_s"])
+        metrics = prepared["metrics"]
+
+        ax.step(target_t, target_s_cm, where="post", color=ROLLOUT_PRIMARY, linewidth=1.6, label="Tracking goal track_s")
+        ax.plot(eef_t, eef_s_cm, color=EXECUTION_COLOR, linewidth=1.5, label="Measured EEF s")
+        if include_trajectory_estimate and traj_t.size:
+            ax.plot(
+                traj_t,
+                traj_s_cm,
+                color=SCENE_SECONDARY,
+                linestyle="-.",
+                linewidth=1.3,
+                alpha=0.95,
+                label="Trajectory-estimated interception s",
+            )
+        ax.plot(ball_t, ball_s_cm, color=SCENE_PRIMARY, linewidth=1.1, alpha=0.9, label="Ball position s")
+        ax.scatter(
+            [ball_max_y_t],
+            [ball_max_y_s_cm],
+            marker="D",
+            s=55,
+            color=SCENE_LIGHT,
+            edgecolors="black",
+            linewidths=0.7,
+            label="Ball at maximum y_table",
+            zorder=7,
+        )
+
+        draw_cont_tracker_timing_markers(
+            ax,
+            first_goto_t_rel=first_goto_t,
+            all_update_t_rel=all_update_t,
+            changed_update_t_rel=changed_update_t,
+            update_line_mode=update_line_mode,
+        )
+
+        annotation = "\n".join(
+            [
+                f"RMSE: {_format_cont_metric_cm(float(metrics['cont_error_rmse_m']))}",
+                f"MAE: {_format_cont_metric_cm(float(metrics['cont_error_mae_m']))}",
+                f"P95 |err|: {_format_cont_metric_cm(float(metrics['cont_error_p95_abs_m']))}",
+                f"Max |err|: {_format_cont_metric_cm(float(metrics['cont_error_max_abs_m']))}",
+                f"Aligned samples: {int(metrics['cont_tracking_sample_count'])}",
+            ]
+        )
+        ax.text(
+            0.02,
+            0.98,
+            annotation,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+            bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.9},
+        )
+        ax.set_title(f"Episode {episode.idx}", fontsize=11, fontweight="bold")
+        ax.set_xlabel("Episode time [s]")
+        ax.set_ylabel("s [cm]")
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(0.0, max(0.1, episode_duration_s))
+
+    for ax in axes.flat[n:]:
+        ax.axis("off")
+
+    handles: List[object] = []
+    labels: List[str] = []
+    for ax in axes.flat[:n]:
+        subplot_handles, subplot_labels = ax.get_legend_handles_labels()
+        for handle, label in zip(subplot_handles, subplot_labels):
+            if label not in labels:
+                handles.append(handle)
+                labels.append(label)
+    if handles:
+        fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.985), ncol=min(4, len(labels)), fontsize=9)
+
+    fig.suptitle("Continuous tracker overview", fontsize=15, fontweight="bold", y=0.998)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    log(f"[INFO] wrote {output}")
+
+
+def plot_episode_cont_tracker(
+    episode: EpisodeData,
+    output: Path,
+    *,
+    track_s_column: str,
+    s_zero_x_m: float,
+    s_sign: int,
+    target_change_eps_m: float,
+    error_band_cm: float,
+    include_trajectory_estimate: bool,
+    update_line_mode: str,
+) -> None:
+    prepared = prepare_cont_tracker_episode_data(
+        episode,
+        track_s_column,
+        s_zero_x_m=s_zero_x_m,
+        s_sign=s_sign,
+        target_change_eps_m=target_change_eps_m,
+        include_trajectory_estimate=include_trajectory_estimate,
+    )
+    target_t = np.asarray(prepared["target_plot_t_rel"], dtype=float)
+    target_s_cm = 100.0 * np.asarray(prepared["target_plot_s_m"], dtype=float)
+    eef_t = np.asarray(prepared["eef_t_rel"], dtype=float)
+    eef_s_cm = 100.0 * np.asarray(prepared["eef_s_m"], dtype=float)
+    error_cm = 100.0 * np.asarray(prepared["error_m"], dtype=float)
+    traj_t = np.asarray(prepared["trajectory_t_rel"], dtype=float)
+    traj_s_cm = 100.0 * np.asarray(prepared["trajectory_estimation_s_m"], dtype=float)
+    ball_t = np.asarray(prepared["ball_t_rel"], dtype=float)
+    ball_s_cm = 100.0 * np.asarray(prepared["ball_s_m"], dtype=float)
+    ball_y_cm = 100.0 * np.asarray(prepared["ball_y_m"], dtype=float)
+    ball_max_y_t = float(prepared["ball_max_y_t_rel"])
+    ball_max_y_s_cm = 100.0 * float(prepared["ball_max_y_s_m"])
+    ball_max_y_cm = 100.0 * float(prepared["ball_max_y_m"])
+    first_goto_t = float(prepared["first_goto_t_rel"])
+    first_goto_s_cm = 100.0 * float(prepared["first_goto_s_m"])
+    all_update_t = np.asarray(prepared["all_update_t_rel"], dtype=float)
+    changed_update_t = np.asarray(prepared["changed_update_t_rel"], dtype=float)
+    episode_duration_s = float(prepared["episode_duration_s"])
+
+    fig, (ax_top, ax_bottom) = plt.subplots(2, 1, figsize=(10.5, 7.2), sharex=True)
+
+    ax_top.step(target_t, target_s_cm, where="post", color=ROLLOUT_PRIMARY, linewidth=1.8, label="Tracking goal track_s")
+    ax_top.plot(eef_t, eef_s_cm, color=EXECUTION_COLOR, linewidth=1.6, label="Measured EEF s")
+    if include_trajectory_estimate and traj_t.size:
+        ax_top.plot(
+            traj_t,
+            traj_s_cm,
+            color=SCENE_SECONDARY,
+            linestyle="-.",
+            linewidth=1.35,
+            alpha=0.95,
+            label="Trajectory-estimated interception s",
+        )
+    ax_top.plot(ball_t, ball_s_cm, color=SCENE_PRIMARY, linewidth=1.2, alpha=0.9, label="Ball position s")
+    ax_top.scatter(
+        [ball_max_y_t],
+        [ball_max_y_s_cm],
+        marker="D",
+        s=66,
+        color=SCENE_LIGHT,
+        edgecolors="black",
+        linewidths=0.8,
+        label="Ball at maximum y_table",
+        zorder=8,
+    )
+
+    draw_cont_tracker_timing_markers(
+        ax_top,
+        first_goto_t_rel=first_goto_t,
+        all_update_t_rel=all_update_t,
+        changed_update_t_rel=changed_update_t,
+        update_line_mode=update_line_mode,
+    )
+    ax_top.set_ylabel("s [cm]")
+    ax_top.set_title(f"Episode {episode.idx}: continuous tracker", fontsize=13, fontweight="bold")
+    ax_top.grid(True, alpha=0.3)
+    ax_top.annotate(
+        (
+            f"t = {ball_max_y_t:.3f} s\n"
+            f"s = {ball_max_y_s_cm:.2f} cm\n"
+            f"max y = {ball_max_y_cm:.2f} cm"
+        ),
+        xy=(ball_max_y_t, ball_max_y_s_cm),
+        xytext=(6, 6),
+        textcoords="offset points",
+        fontsize=8,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.88},
+    )
+    ax_top.annotate(
+        f"First GOTO_S\nt = {first_goto_t:.3f} s\ns = {first_goto_s_cm:.2f} cm",
+        xy=(first_goto_t, first_goto_s_cm),
+        xytext=(8, -10),
+        textcoords="offset points",
+        fontsize=8,
+        ha="left",
+        va="top",
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.88},
+    )
+
+    ax_bottom.plot(eef_t, error_cm, color=SCENE_PRIMARY, linewidth=1.6, label="Tracking error: EEF s - track_s")
+    ax_bottom.axhline(0.0, color=NEUTRAL_COLOR, linestyle="--", linewidth=1.0)
+    ax_bottom.axhspan(-float(error_band_cm), float(error_band_cm), color="#c8e6c9", alpha=0.35)
+    draw_cont_tracker_timing_markers(
+        ax_bottom,
+        first_goto_t_rel=first_goto_t,
+        all_update_t_rel=all_update_t,
+        changed_update_t_rel=changed_update_t,
+        update_line_mode=update_line_mode,
+    )
+    ax_bottom.set_xlabel("Episode time [s]")
+    ax_bottom.set_ylabel("error [cm]")
+    ax_bottom.grid(True, alpha=0.3)
+    ax_bottom.set_xlim(0.0, max(0.1, episode_duration_s))
+
+    top_handles, top_labels = ax_top.get_legend_handles_labels()
+    if top_handles:
+        ax_top.legend(top_handles, top_labels, loc="best", fontsize=9)
+
+    bottom_handles, bottom_labels = ax_bottom.get_legend_handles_labels()
+    dedup_handles: List[object] = []
+    dedup_labels: List[str] = []
+    for handle, label in zip(bottom_handles, bottom_labels):
+        if label not in dedup_labels:
+            dedup_handles.append(handle)
+            dedup_labels.append(label)
+    if dedup_handles:
+        ax_bottom.legend(dedup_handles, dedup_labels, loc="best", fontsize=9)
+
+    fig.tight_layout()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    log(f"[INFO] wrote {output}")
+
+
 def write_episode_summary(
     episodes: Sequence[EpisodeData],
     output: Path,
@@ -2348,6 +3055,10 @@ def write_episode_summary(
     event_match_max_gap_sec: float,
     s_zero_x_m: float,
     s_sign: int,
+    include_rollout: bool,
+    include_cont_tracker: bool,
+    track_s_column: Optional[str],
+    cont_target_change_eps_m: float,
 ) -> None:
     def coerce_float_or_nan(value: object) -> float:
         if value is None:
@@ -2394,25 +3105,46 @@ def write_episode_summary(
             row["executed_s_from_center_m"] = None
 
         row.update(episode_timing_metrics(episode))
-        row.update(
-            derive_rollout_metrics(
+        if include_rollout:
+            row.update(
+                derive_rollout_metrics(
+                    episode,
+                    prediction_s_column_name=prediction_s_column_name,
+                    prediction_probability_column_name=prediction_probability_column_name,
+                    event_match_max_gap_sec=event_match_max_gap_sec,
+                    s_zero_x_m=s_zero_x_m,
+                    s_sign=s_sign,
+                )
+            )
+            row.update(rollout_episode_scalar_metrics(episode))
+
+        if include_cont_tracker:
+            if track_s_column is None:
+                raise RuntimeError("internal error: track_s_column is required for cont-tracker summary")
+            prepared = prepare_cont_tracker_episode_data(
                 episode,
-                prediction_s_column_name=prediction_s_column_name,
-                prediction_probability_column_name=prediction_probability_column_name,
-                event_match_max_gap_sec=event_match_max_gap_sec,
+                track_s_column,
                 s_zero_x_m=s_zero_x_m,
                 s_sign=s_sign,
+                target_change_eps_m=cont_target_change_eps_m,
+                include_trajectory_estimate=False,
             )
-        )
-        row.update(rollout_episode_scalar_metrics(episode))
+            row.update(prepared["metrics"])
+
         rows.append(row)
+
+    aggregate_columns: List[str] = list(AGGREGATE_SUMMARY_COLUMNS)
+    if include_rollout:
+        aggregate_columns.extend(ROLLOUT_SUMMARY_COLUMNS)
+    if include_cont_tracker:
+        aggregate_columns.extend(CONT_TRACKER_SUMMARY_COLUMNS)
 
     episode_rows = list(rows)
     aggregate_stats = {
         column: finite_stats([
             coerce_float_or_nan(row.get(column, float("nan"))) for row in episode_rows
         ])
-        for column in AGGREGATE_SUMMARY_COLUMNS
+        for column in aggregate_columns
     }
     for statistic in ("min", "mean", "max"):
         aggregate: Dict[str, object] = {
@@ -2420,7 +3152,7 @@ def write_episode_summary(
             "statistic": statistic,
             "episode_idx": "",
         }
-        for column in AGGREGATE_SUMMARY_COLUMNS:
+        for column in aggregate_columns:
             stats = aggregate_stats[column]
             aggregate[column] = float(stats[statistic]) if stats["count"] > 0 else float("nan")
             aggregate[f"{column}_count"] = int(stats["count"])
@@ -2439,13 +3171,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, required=True, help="Directory for PNG plots and summary CSV.")
     parser.add_argument(
         "--plot-mode",
-        choices=("standard", "xy", "both", "rollout", "all"),
+        choices=("standard", "xy", "both", "cont_tracker", "all"),
         default="standard",
         help=(
             "Plot family to generate: standard x/y-versus-time plots, top-down "
-            "table-frame XY overlays, rollout analysis, legacy both (standard+xy), "
-            "or all (standard+xy+rollout). Default: standard."
+            "table-frame XY overlays, continuous-tracker analysis, legacy both "
+            "(standard+xy), or all (standard+xy+continuous-tracker). "
+            "Use --include-rollout to add rollout plots. Default: standard."
         ),
+    )
+    parser.add_argument(
+        "--include-rollout",
+        action="store_true",
+        help="Enable rollout CSV loading, rollout metrics, and rollout plot generation.",
     )
     parser.add_argument(
         "--episodes",
@@ -2535,6 +3273,40 @@ def parse_args() -> argparse.Namespace:
         help="Override ACT prediction probability column name in /act/intercept_prediction CSV.",
     )
     parser.add_argument(
+        "--cont-track-topic",
+        type=str,
+        default=DEFAULT_CONT_TRACK_TOPIC,
+        help="Continuous tracker topic path. Default: /cont_tracker/track_s.",
+    )
+    parser.add_argument(
+        "--track-s-column",
+        type=str,
+        default=None,
+        help="Override target s column name in continuous tracker CSV.",
+    )
+    parser.add_argument(
+        "--cont-target-change-eps-m",
+        type=float,
+        default=0.0001,
+        help="Minimum |delta track_s| [m] considered a meaningful target update. Default: 0.0001.",
+    )
+    parser.add_argument(
+        "--cont-error-band-cm",
+        type=float,
+        default=0.5,
+        help="Error-band half-width [cm] for continuous-tracker detail error plot. Default: 0.5.",
+    )
+    parser.add_argument(
+        "--cont-track-update-lines",
+        choices=("all", "changed", "none"),
+        default="all",
+        help=(
+            "Vertical timing lines for subsequent track_s updates in continuous-tracker plots: "
+            "all messages, only changed targets, or none. Default: all. "
+            "The first command line is always shown separately."
+        ),
+    )
+    parser.add_argument(
         "--event-match-max-gap-sec",
         type=float,
         default=0.10,
@@ -2572,13 +3344,13 @@ def parse_args() -> argparse.Namespace:
         "--rollout-prediction-y-offset-cm",
         type=float,
         default=2.0,
-        help="Vertical offset above interception line for rollout prediction evolution, in cm. Default: 1.0.",
+        help="Vertical offset above interception line for rollout prediction evolution, in cm. Default: 2.0.",
     )
     parser.add_argument(
         "--rollout-eef-y-offset-cm",
         type=float,
         default=3.0,
-        help="Vertical offset above interception line for EEF trajectory in rollout plots, in cm. Default: 2.0.",
+        help="Vertical offset above interception line for EEF trajectory in rollout plots, in cm. Default: 3.0.",
     )
 
     fk = parser.add_argument_group("optional TCP forward kinematics")
@@ -2606,6 +3378,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    do_standard = args.plot_mode in {"standard", "both", "all"}
+    do_xy = args.plot_mode in {"xy", "both", "all"}
+    do_cont_tracker = args.plot_mode in {"cont_tracker", "all"}
+    do_rollout = bool(args.include_rollout)
+    require_ball = do_standard or do_xy
+
     if not args.csv_dir.is_dir():
         raise FileNotFoundError(f"CSV directory not found: {args.csv_dir}")
     if args.overview_columns <= 0:
@@ -2626,6 +3404,10 @@ def main() -> None:
         raise FileNotFoundError(f"URDF not found: {args.urdf}")
     if args.event_match_max_gap_sec <= 0.0:
         raise ValueError("--event-match-max-gap-sec must be positive")
+    if args.cont_target_change_eps_m < 0.0:
+        raise ValueError("--cont-target-change-eps-m must be non-negative")
+    if args.cont_error_band_cm < 0.0:
+        raise ValueError("--cont-error-band-cm must be non-negative")
     if args.rollout_main_x_scale <= 0.0:
         raise ValueError("--rollout-main-x-scale must be positive")
 
@@ -2633,23 +3415,61 @@ def main() -> None:
     log(f"[INFO] s-to-table mapping: x_table = {float(args.s_zero_x_m):.3f} {mapping_op} s")
 
     table_pose = parse_table_pose(args.table_pose_base)
-    episodes = load_episodes(args.csv_dir, requested=args.episodes)
-    prediction_s_column_name, prediction_probability_column_name = resolve_prediction_columns_for_episodes(
-        episodes,
-        override_s_column=args.prediction_s_column,
-        override_probability_column=args.prediction_probability_column,
-    )
-    add_tcp_and_transforms(
-        episodes,
-        urdf=args.urdf,
-        tcp_frame=args.tcp_frame,
-        table_pose=table_pose,
+    episodes = load_episodes(
+        args.csv_dir,
+        requested=args.episodes,
+        require_ball=require_ball,
+        include_rollout=do_rollout,
+        enable_cont_tracker=do_cont_tracker,
+        require_cont_trajectory=(do_cont_tracker and (not args.no_trajectory_estimate)),
+        cont_track_topic=args.cont_track_topic,
     )
 
+    prediction_s_column_name: Optional[str] = None
+    prediction_probability_column_name: Optional[str] = None
+    if do_rollout:
+        prediction_s_column_name, prediction_probability_column_name = resolve_prediction_columns_for_episodes(
+            episodes,
+            override_s_column=args.prediction_s_column,
+            override_probability_column=args.prediction_probability_column,
+        )
+
+    try:
+        add_tcp_and_transforms(
+            episodes,
+            urdf=args.urdf,
+            tcp_frame=args.tcp_frame,
+            table_pose=table_pose,
+        )
+    except RuntimeError as exc:
+        if do_cont_tracker:
+            raise RuntimeError(
+                "Continuous-tracker analysis requires usable TCP table-frame data. "
+                "Check --urdf, --tcp-frame, and table pose availability."
+            ) from exc
+        raise
+
+    track_s_column: Optional[str] = None
+    if do_cont_tracker:
+        all_track = pd.concat([ep.track_s for ep in episodes if not ep.track_s.empty], ignore_index=True)
+        expected_track_csv = topic_to_filename(args.cont_track_topic)
+        if all_track.empty:
+            raise RuntimeError(
+                "Continuous-tracker mode requires non-empty tracking goal data. "
+                f"Expected topic {args.cont_track_topic!r} in CSV {expected_track_csv!r}. "
+                "Ensure the topic is recorded and exported with bag_to_csv.py."
+            )
+        track_s_column = resolve_track_s_column(all_track, args.track_s_column)
+        log(f"[INFO] continuous tracker column: s={track_s_column}")
+
+        for episode in episodes:
+            if episode.tcp_table is None or episode.tcp_table.empty or "x_table" not in episode.tcp_table.columns:
+                raise RuntimeError(
+                    "Continuous-tracker analysis requires usable TCP table-frame data. "
+                    "Provide a usable --urdf, --tcp-frame, and valid table pose so FK and base->table transform succeed."
+                )
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    do_standard = args.plot_mode in {"standard", "both", "all"}
-    do_xy = args.plot_mode in {"xy", "both", "all"}
-    do_rollout = args.plot_mode in {"rollout", "all"}
 
     if do_standard:
         plot_x_overview(
@@ -2687,6 +3507,35 @@ def main() -> None:
                     episode,
                     args.out_dir / f"episode_{episode.idx:02d}_xy.png",
                     table_bounds_cm=table_bounds_cm,
+                )
+
+    if do_cont_tracker:
+        if track_s_column is None:
+            raise RuntimeError("internal error: missing continuous tracker column")
+        plot_cont_tracker_overview(
+            episodes,
+            args.out_dir / "cont_tracker_overview.png",
+            columns=args.overview_columns,
+            track_s_column=track_s_column,
+            s_zero_x_m=float(args.s_zero_x_m),
+            s_sign=int(args.s_sign),
+            target_change_eps_m=float(args.cont_target_change_eps_m),
+            include_trajectory_estimate=(not args.no_trajectory_estimate),
+            update_line_mode=args.cont_track_update_lines,
+        )
+
+        if not args.no_detail_plots:
+            for episode in episodes:
+                plot_episode_cont_tracker(
+                    episode,
+                    args.out_dir / f"episode_{episode.idx:02d}_cont_tracker.png",
+                    track_s_column=track_s_column,
+                    s_zero_x_m=float(args.s_zero_x_m),
+                    s_sign=int(args.s_sign),
+                    target_change_eps_m=float(args.cont_target_change_eps_m),
+                    error_band_cm=float(args.cont_error_band_cm),
+                    include_trajectory_estimate=(not args.no_trajectory_estimate),
+                    update_line_mode=args.cont_track_update_lines,
                 )
 
     if do_rollout:
@@ -2730,6 +3579,10 @@ def main() -> None:
         event_match_max_gap_sec=float(args.event_match_max_gap_sec),
         s_zero_x_m=float(args.s_zero_x_m),
         s_sign=int(args.s_sign),
+        include_rollout=do_rollout,
+        include_cont_tracker=do_cont_tracker,
+        track_s_column=track_s_column,
+        cont_target_change_eps_m=float(args.cont_target_change_eps_m),
     )
 
     log("")
