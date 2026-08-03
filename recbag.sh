@@ -51,66 +51,59 @@ OUT="${OUT_ROOT}/${BAG_NAME}"
 mkdir -p "$OUT_ROOT"
 
 TOPICS=(
-  # Episode boundaries
+  # Episode boundaries and collection progress
   /episode/control
+  /data_collection/num_valid_episodes
 
-  # ACT policy output
-  /act/intercept_prediction
+  # ACT outputs
+  /act/intercept_prediction_chunk_abs_s
+  /act/intercept_prediction_current_abs_s
 
-  # Classical scene estimation
+  # Ball observation and classical prediction
   /ball_tracker2/ball_2d_px
   /scene_localizer/top_cam/ball_3d_table
   /scene/ball_trajectory_table
   /scene/middle_line_intersection_pose_robot_base
 
-  # Scene interception controller (SIC)
+  # Classical interception controller
   /interception_controller/status
   /interception_controller/selected_goto_s
   /interception_controller/commanded_target_table
 
-  # Rollout interception controller (RIC)
+  # Rollout interception controller
   /rollout_interception_controller/status
   /rollout_interception_controller/selected_goto_s
   /rollout_interception_controller/commanded_target_table
 
-  # Continuous tracker:
-  # requested, accepted-for-analysis, telemetry, and Cartesian target
+  # Continuous tracking request and measured robot position
+  /cont_tracker/accepted_target_s
   /cont_tracker/target_s
   /cont_tracker/track_s
-  /cont_tracker/accepted_target_s
-  /cont_tracker/accepted_target_base
+  /middle_line/current_tcp_s
 
-  # Executor/controller state
-  /trajectory_executor/executed_goto_s
-  /trajectory_executor/executed_goto_s_target_base
-  /trajectory_executor/middle_line_state
-  /cartesian_executor/status
-  /cartesian_cmd/twist
-
-  # Robot measurements and low-level diagnostics
+  # Robot measurements
   /joint_states
-  /right_fr3/joint_states
-  /right_franka_robot_state_broadcaster/robot_state
-  /right_franka/external_wrenches
 
-  # Experimental configuration
-  /teleop/interception_arm_mode
-  /teleop/interception_arm_inhibit
+  # Teleoperation/arming commands
+  /teleop/control
 
-  # Coordinate transforms
+  # Scene geometry and transform provenance
+  /scene_localizer/table_pose_frozen
   /scene_localizer/table_pose_robot_base
   /scene_localizer/top_cam/camera_pose_robot_base
+  /scene_localizer/top_cam/table_pose_camera
   /tf
   /tf_static
 
-  # Logs: useful for controller errors, cancellations, and reflexes
+  # Errors, cancellations, and reflex messages
   /rosout
 )
 
 # Camera images are recorded by default.
 if [[ "$RECORD_IMAGES" == true ]]; then
   TOPICS+=(
-    /top_cam/camera/color/image_raw/compressed
+    /top_cam/camera/color/image_raw
+    /openmv_cam/event_frame_3ch
     /top_cam/camera/color/camera_info
   )
 fi
