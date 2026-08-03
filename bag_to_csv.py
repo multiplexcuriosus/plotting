@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+    #!/usr/bin/env python3
 """
 Convert ROS 2 bag topics to one CSV per topic.
 
@@ -80,6 +80,13 @@ def stamp_to_sec(stamp: Any) -> float:
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def resolve_output_dir(bag_path: str, out_dir_arg: Optional[str]) -> str:
+    bag_abs = os.path.abspath(bag_path)
+    if out_dir_arg:
+        return os.path.abspath(out_dir_arg)
+    return os.path.join(bag_abs, "csv")
 
 
 def safe_filename_from_topic(topic: str) -> str:
@@ -866,6 +873,10 @@ def convert_bag_to_csv(args: argparse.Namespace) -> None:
         log(f"[INFO] detected storage id: {storage_id}")
 
     out_dir = args.out_dir
+    if not os.path.exists(out_dir):
+        log(f"[INFO] output directory does not exist; creating: {out_dir}")
+    else:
+        log(f"[INFO] output directory exists; overwriting same-named CSV files in: {out_dir}")
     ensure_dir(out_dir)
 
     reader = open_reader(bag_path, storage_id=storage_id)
@@ -1019,6 +1030,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use_episode_windows",
         action="store_true",
+        default=True,
         help="Only export messages inside committed /episode/control windows. Adds episode_idx and t_episode columns.",
     )
     parser.add_argument(
@@ -1070,6 +1082,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    user_provided_out_dir = bool(args.out_dir)
 
     if args.start_sec is not None and args.end_sec is not None and args.end_sec < args.start_sec:
         raise RuntimeError("--end_sec must be >= --start_sec")
@@ -1078,11 +1091,9 @@ def main() -> None:
     if args.max_array_len < 0:
         raise RuntimeError("--max_array_len must be >= 0")
 
-    args.out_dir = (
-        os.path.abspath(args.out_dir)
-        if args.out_dir
-        else os.path.join(os.path.abspath(args.bag), "csv")
-    )
+    args.out_dir = resolve_output_dir(args.bag, args.out_dir)
+    if not user_provided_out_dir:
+        log(f"[INFO] no --out_dir provided; defaulting to: {args.out_dir}")
 
     convert_bag_to_csv(args)
 
