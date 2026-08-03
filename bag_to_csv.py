@@ -26,6 +26,8 @@ import rosbag2_py
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 
+from intercept_dataset_common import EventLogEntry, parse_episode_control_events
+
 
 TOPIC_EPISODE = "/episode/control"
 
@@ -235,8 +237,7 @@ def extract_episode_windows(
         raise RuntimeError(f"episode topic not found in bag: {episode_topic}")
 
     msg_cls = get_message(topic_type_map[episode_topic])
-    current_start: Optional[float] = None
-    committed_windows: List[EpisodeWindow] = []
+    events: List[EventLogEntry] = []
 
     n_episode_msgs = 0
 
@@ -249,44 +250,20 @@ def extract_episode_windows(
         msg = deserialize_message(raw, msg_cls)
         t = bag_timestamp_to_sec(t_ns)
         value = getattr(msg, "data", None)
+        events.append(EventLogEntry(timestamp=t, value=int(value)))
 
-        if value == 1:
-            if current_start is None:
-                current_start = t
-            else:
-                log("[WARNING] start received while already recording; ignoring duplicate start")
+    parsed, warnings = parse_episode_control_events(events)
+    for warning in warnings:
+        log(f"[WARNING] {warning}")
 
-        elif value == 2:
-            if current_start is None:
-                log("[WARNING] stop received while not recording; ignoring")
-            else:
-                committed_windows.append(
-                    EpisodeWindow(idx=len(committed_windows), start=current_start, end=t)
-                )
-                current_start = None
-
-        elif value == 3:
-            if current_start is not None:
-                current_start = None
-            else:
-                log("[WARNING] cancel_current received while not recording; ignoring")
-
-        elif value == 4:
-            if current_start is not None:
-                log("[WARNING] cancel_last received while recording; ignoring")
-            elif committed_windows:
-                committed_windows.pop()
-                for i, ep in enumerate(committed_windows):
-                    ep.idx = i
-            else:
-                log("[WARNING] cancel_last received but no committed episode exists")
-
-        else:
-            log(f"[WARNING] unknown episode marker {value}; ignoring")
-
-    if current_start is not None:
-        log(f"[WARNING] bag ended during unfinished episode from {current_start:.9f}; discarding")
-
+    committed_windows = [
+        EpisodeWindow(
+            idx=ep.episode_id,
+            start=ep.start_timestamp,
+            end=ep.end_timestamp,
+        )
+        for ep in parsed
+    ]
     return committed_windows, n_episode_msgs
 
 
