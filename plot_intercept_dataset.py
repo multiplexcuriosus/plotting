@@ -17,13 +17,19 @@ import pandas as pd
 
 from intercept_dataset_common import (
     assign_global_episode_id,
+    classify_lateral_intercept,
     detect_max_y_intercept,
     detect_middle_line_crossing,
     detect_motion_onset_time,
+    directional_count_bias,
+    interpolate_approach_on_y_grid,
     interpolate_position_at_time,
     pick_representative_classic_row,
     require_columns,
     resolve_dataset_csv_dir,
+    sample_descriptive_statistics,
+    select_monotonic_approach_points,
+    summarize_episode_grid,
     summarize_classic_counts,
     table_x_to_s,
     validate_no_duplicate_source_ids,
@@ -38,6 +44,9 @@ ALL_EVENT_NAMES = [
     "vision-intercept",
 ]
 
+TRAJECTORY_DISTRIBUTION_GRID_POINTS = 200
+LR_COLORS = {"L": "tab:blue", "R": "tab:orange", "deadband": "0.45"}
+
 
 def log(message: str) -> None:
     print(message, flush=True)
@@ -46,6 +55,7 @@ def log(message: str) -> None:
 @dataclass
 class SourceDataset:
     source_id: str
+    source_bag: str
     dataset_dir: Path
     manifest: pd.DataFrame
     ball: pd.DataFrame
@@ -59,6 +69,15 @@ class CombinedDataset:
     classic: pd.DataFrame
     source_summaries: List[Dict[str, Any]]
     dataset_dirs: List[Path]
+    source_bags: Dict[str, str]
+
+
+@dataclass
+class TrajectoryDistributionAnalysis:
+    episodes: pd.DataFrame
+    summary: pd.DataFrame
+    mean_grid: pd.DataFrame
+    raw_segments: Dict[Tuple[str, int], Tuple[np.ndarray, np.ndarray]]
 
 
 def parse_bool_col(series: pd.Series) -> pd.Series:
@@ -147,6 +166,22 @@ def load_one_source(input_path: str) -> SourceDataset:
             f"{manifest_path} must contain exactly one source_id, got {source_ids}"
         )
     source_id = source_ids[0]
+    source_bag = ""
+    metadata_path = dataset_dir / "extraction_metadata.json"
+    if metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata_source_id = str(metadata.get("source_id", "")).strip()
+            if metadata_source_id and metadata_source_id != source_id:
+                raise RuntimeError(
+                    f"{metadata_path} source_id '{metadata_source_id}' does not "
+                    f"match manifest source_id '{source_id}'"
+                )
+            source_bag = str(metadata.get("source_bag_path", "")).strip()
+        except (OSError, ValueError, TypeError) as exc:
+            log(f"[WARNING] Could not read source bag metadata from {metadata_path}: {exc}")
+    else:
+        log(f"[WARNING] Missing {metadata_path}; per-episode source_bag will be blank")
 
     manifest = manifest.copy()
     manifest["episode_id"] = manifest["episode_id"].astype(int)
@@ -173,6 +208,7 @@ def load_one_source(input_path: str) -> SourceDataset:
 
     return SourceDataset(
         source_id=source_id,
+        source_bag=source_bag,
         dataset_dir=dataset_dir,
         manifest=manifest,
         ball=ball,
@@ -202,6 +238,7 @@ def combine_sources(inputs: Sequence[str]) -> CombinedDataset:
         out_sources.append(
             SourceDataset(
                 source_id=source.source_id,
+                source_bag=source.source_bag,
                 dataset_dir=source.dataset_dir,
                 manifest=manifest_with_gid,
                 ball=ball,
@@ -239,6 +276,7 @@ def combine_sources(inputs: Sequence[str]) -> CombinedDataset:
         classic=classic,
         source_summaries=summary_rows,
         dataset_dirs=[s.dataset_dir for s in out_sources],
+        source_bags={s.source_id: s.source_bag for s in out_sources},
     )
 
 
@@ -448,6 +486,285 @@ def _collect_episode_events(
         event_info[key] = data
 
     return event_info, stats
+
+
+def _analysis_exclusion_row(
+    row: Any,
+    source_bag: str,
+    reason: str,
+) -> Dict[str, Any]:
+    return {
+        "source_bag": source_bag,
+        "source_id": str(row.source_id),
+        "episode_id": int(row.episode_id),
+        "global_episode_id": int(row.global_episode_id),
+        "s_onset": np.nan,
+        "s_int": np.nan,
+        "delta_s": np.nan,
+        "classification": "unavailable",
+        "included": False,
+        "exclusion_reason": reason,
+    }
+
+
+def _build_approach_segment(
+    timestamps: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+    onset_time: float,
+    crossing_time: float,
+    crossing_x: float,
+    line_center_x: float,
+    s_sign: float,
+    middle_line_y: float,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Return raw and monotonic (s, y) onset-to-crossing segments."""
+    onset_position = interpolate_position_at_time(
+        timestamps, x, y, event_time=onset_time
+    )
+    if onset_position is None:
+        return None
+
+    interior = (timestamps > onset_time) & (timestamps < crossing_time)
+    raw_x = np.concatenate(
+        [
+            np.asarray([onset_position[0]], dtype=float),
+            x[interior],
+            np.asarray([crossing_x], dtype=float),
+        ]
+    )
+    raw_y = np.concatenate(
+        [
+            np.asarray([onset_position[1]], dtype=float),
+            y[interior],
+            np.asarray([middle_line_y], dtype=float),
+        ]
+    )
+    raw_s = table_x_to_s(raw_x, line_center_x=line_center_x, s_sign=s_sign)
+    monotonic_y, monotonic_s = select_monotonic_approach_points(raw_y, raw_s)
+
+    if monotonic_y.size > 0 and np.isclose(monotonic_y[-1], middle_line_y):
+        monotonic_y[-1] = float(middle_line_y)
+        monotonic_s[-1] = float(raw_s[-1])
+    elif monotonic_y.size > 0 and middle_line_y > monotonic_y[-1]:
+        monotonic_y = np.append(monotonic_y, float(middle_line_y))
+        monotonic_s = np.append(monotonic_s, float(raw_s[-1]))
+
+    if monotonic_y.size < 2 or np.any(np.diff(monotonic_y) <= 0.0):
+        return None
+    return raw_s, raw_y, monotonic_s, monotonic_y
+
+
+def _summary_row_for_scope(
+    scope: str,
+    source_id: str,
+    source_bag: str,
+    scope_episodes: pd.DataFrame,
+) -> Dict[str, Any]:
+    usable = scope_episodes[scope_episodes["included"]]
+    n_usable = int(len(usable))
+    counts = {
+        group: int((usable["classification"] == group).sum())
+        for group in ["L", "R", "deadband"]
+    }
+    result: Dict[str, Any] = {
+        "scope": scope,
+        "source_id": source_id,
+        "source_bag": source_bag,
+        "total_episodes": int(len(scope_episodes)),
+        "usable_episodes": n_usable,
+        "excluded_episodes": int(len(scope_episodes) - n_usable),
+        "N_L": counts["L"],
+        "N_R": counts["R"],
+        "N_deadband": counts["deadband"],
+        "percentage_denominator": "usable_including_deadband",
+        "pct_L": 100.0 * counts["L"] / n_usable if n_usable else np.nan,
+        "pct_R": 100.0 * counts["R"] / n_usable if n_usable else np.nan,
+        "pct_deadband": 100.0 * counts["deadband"] / n_usable if n_usable else np.nan,
+        "directional_count_bias_B": directional_count_bias(counts["L"], counts["R"]),
+    }
+    for group in ["L", "R"]:
+        stats = sample_descriptive_statistics(
+            usable.loc[usable["classification"] == group, "s_int"].to_numpy(dtype=float)
+        )
+        for name, value in stats.items():
+            result[f"{group}_s_int_{name}"] = value
+    return result
+
+
+def analyze_trajectory_distribution(
+    combined: CombinedDataset,
+    args: argparse.Namespace,
+) -> TrajectoryDistributionAnalysis:
+    episode_rows: List[Dict[str, Any]] = []
+    raw_segments: Dict[Tuple[str, int], Tuple[np.ndarray, np.ndarray]] = {}
+    monotonic_segments: Dict[Tuple[str, int], Tuple[np.ndarray, np.ndarray]] = {}
+
+    for row in combined.manifest.sort_values("global_episode_id").itertuples(index=False):
+        source_id = str(row.source_id)
+        key = (source_id, int(row.episode_id))
+        source_bag = combined.source_bags.get(source_id, "")
+        invalid_reason = "" if pd.isna(row.invalid_reason) else str(row.invalid_reason).strip()
+        if not bool(row.valid):
+            reason = invalid_reason or "manifest_invalid"
+            episode_rows.append(_analysis_exclusion_row(row, source_bag, reason))
+            continue
+
+        epi_ball = combined.ball[
+            (combined.ball["source_id"] == source_id)
+            & (combined.ball["episode_id"] == int(row.episode_id))
+        ].sort_values("timestamp", kind="mergesort")
+        finite = np.isfinite(
+            epi_ball[["timestamp", "x", "y"]].to_numpy(dtype=float)
+        ).all(axis=1)
+        epi_ball = epi_ball.loc[finite]
+        if len(epi_ball) < 2:
+            episode_rows.append(
+                _analysis_exclusion_row(row, source_bag, "insufficient_finite_ball_samples")
+            )
+            continue
+
+        t = epi_ball["timestamp"].to_numpy(dtype=float)
+        x = epi_ball["x"].to_numpy(dtype=float)
+        y = epi_ball["y"].to_numpy(dtype=float)
+        onset = detect_motion_onset_time(
+            timestamps=t,
+            x=x,
+            y=y,
+            speed_threshold_mps=args.motion_speed_threshold_mps,
+            min_consecutive=args.motion_min_consecutive,
+            smoothing_window=args.motion_smoothing_window,
+            min_displacement_m=args.motion_min_displacement_m,
+        )
+        if onset is None:
+            episode_rows.append(
+                _analysis_exclusion_row(row, source_bag, "motion_onset_unavailable")
+            )
+            continue
+
+        crossing_time, crossing_x = detect_middle_line_crossing(
+            timestamps=t,
+            x=x,
+            y=y,
+            middle_line_y=args.middle_line_y,
+            motion_onset_time=onset,
+        )
+        if crossing_time is None or crossing_x is None:
+            episode_rows.append(
+                _analysis_exclusion_row(row, source_bag, "middle_line_crossing_unavailable")
+            )
+            continue
+
+        segment = _build_approach_segment(
+            timestamps=t,
+            x=x,
+            y=y,
+            onset_time=float(onset),
+            crossing_time=float(crossing_time),
+            crossing_x=float(crossing_x),
+            line_center_x=args.line_center_x,
+            s_sign=args.s_sign,
+            middle_line_y=args.middle_line_y,
+        )
+        if segment is None:
+            episode_rows.append(
+                _analysis_exclusion_row(row, source_bag, "invalid_monotonic_approach_segment")
+            )
+            continue
+
+        raw_s, raw_y, monotonic_s, monotonic_y = segment
+        s_onset = float(raw_s[0])
+        s_int = float(raw_s[-1])
+        classification = classify_lateral_intercept(
+            s_int, args.lr_deadband_epsilon_m
+        )
+        episode_rows.append(
+            {
+                "source_bag": source_bag,
+                "source_id": source_id,
+                "episode_id": int(row.episode_id),
+                "global_episode_id": int(row.global_episode_id),
+                "s_onset": s_onset,
+                "s_int": s_int,
+                "delta_s": float(s_int - s_onset),
+                "classification": classification,
+                "included": True,
+                "exclusion_reason": "",
+            }
+        )
+        raw_segments[key] = (raw_s, raw_y)
+        monotonic_segments[key] = (monotonic_y, monotonic_s)
+
+    episodes = pd.DataFrame(episode_rows)
+    episodes["included"] = episodes["included"].astype(bool)
+
+    scopes: List[Tuple[str, str, str, pd.DataFrame]] = [
+        ("combined", "", "", episodes)
+    ]
+    for source_id in combined.manifest["source_id"].astype(str).drop_duplicates():
+        scopes.append(
+            (
+                "source",
+                source_id,
+                combined.source_bags.get(source_id, ""),
+                episodes[episodes["source_id"] == source_id],
+            )
+        )
+
+    summary = pd.DataFrame(
+        [
+            _summary_row_for_scope(scope, source_id, source_bag, scope_episodes)
+            for scope, source_id, source_bag, scope_episodes in scopes
+        ]
+    )
+
+    grid_rows: List[Dict[str, Any]] = []
+    for scope, source_id, _source_bag, scope_episodes in scopes:
+        included = scope_episodes[scope_episodes["included"]]
+        scope_keys = [
+            (str(row.source_id), int(row.episode_id))
+            for row in included.itertuples(index=False)
+        ]
+        if not scope_keys:
+            continue
+        y_min = min(float(monotonic_segments[key][0][0]) for key in scope_keys)
+        y_grid = np.linspace(
+            y_min, float(args.middle_line_y), TRAJECTORY_DISTRIBUTION_GRID_POINTS
+        )
+        for group in ["L", "R"]:
+            group_rows = included[included["classification"] == group]
+            matrices = []
+            for row in group_rows.itertuples(index=False):
+                key = (str(row.source_id), int(row.episode_id))
+                epi_y, epi_s = monotonic_segments[key]
+                matrices.append(interpolate_approach_on_y_grid(epi_y, epi_s, y_grid))
+            values = (
+                np.vstack(matrices)
+                if matrices
+                else np.empty((0, TRAJECTORY_DISTRIBUTION_GRID_POINTS), dtype=float)
+            )
+            stats = summarize_episode_grid(values)
+            for idx, y_value in enumerate(y_grid):
+                grid_rows.append(
+                    {
+                        "scope": scope,
+                        "source_id": source_id,
+                        "classification": group,
+                        "y": float(y_value),
+                        "contributing_episode_count": int(stats["count"][idx]),
+                        "mean_s": float(stats["mean"][idx]),
+                        "sample_std_s": float(stats["sample_std"][idx]),
+                        "q25_s": float(stats["q25"][idx]),
+                        "q75_s": float(stats["q75"][idx]),
+                    }
+                )
+
+    return TrajectoryDistributionAnalysis(
+        episodes=episodes,
+        summary=summary,
+        mean_grid=pd.DataFrame(grid_rows),
+        raw_segments=raw_segments,
+    )
 
 
 def _plot_xy_overlay(
@@ -705,6 +1022,195 @@ def _plot_s_time_overlay(
     plt.close(fig)
 
 
+def _plot_trajectory_distribution(
+    analysis: TrajectoryDistributionAnalysis,
+    args: argparse.Namespace,
+    out_paths: Sequence[Path],
+) -> None:
+    included = analysis.episodes[analysis.episodes["included"]]
+    combined_grid = analysis.mean_grid[analysis.mean_grid["scope"] == "combined"]
+    summary = analysis.summary[analysis.summary["scope"] == "combined"].iloc[0]
+
+    fig = plt.figure(figsize=(15, 8.5))
+    grid_spec = fig.add_gridspec(2, 2, width_ratios=[1.7, 1.0], hspace=0.34, wspace=0.28)
+    ax_spatial = fig.add_subplot(grid_spec[:, 0])
+    ax_distribution = fig.add_subplot(grid_spec[0, 1])
+    ax_counts = fig.add_subplot(grid_spec[1, 1])
+
+    table_xlim = tuple(args.table_x_limits)
+    table_ylim = tuple(args.table_y_limits)
+    s_limits = table_x_to_s(
+        np.asarray(table_xlim, dtype=float),
+        line_center_x=args.line_center_x,
+        s_sign=args.s_sign,
+    )
+    s_min, s_max = float(min(s_limits)), float(max(s_limits))
+    ax_spatial.set_xlim(s_min, s_max)
+    ax_spatial.invert_xaxis()
+    ax_spatial.set_ylim(table_ylim)
+    ax_spatial.set_aspect("equal", adjustable="box")
+    ax_spatial.plot(
+        [s_min, s_max, s_max, s_min, s_min],
+        [table_ylim[0], table_ylim[0], table_ylim[1], table_ylim[1], table_ylim[0]],
+        color="0.55",
+        lw=0.8,
+        alpha=0.5,
+    )
+    ax_spatial.axhline(args.middle_line_y, color="0.35", lw=1.0, alpha=0.65)
+    ax_spatial.axvline(0.0, color="0.5", lw=0.8, ls=":", alpha=0.65)
+
+    for row in included.itertuples(index=False):
+        key = (str(row.source_id), int(row.episode_id))
+        segment = analysis.raw_segments.get(key)
+        if segment is None:
+            continue
+        raw_s, raw_y = segment
+        color = LR_COLORS[str(row.classification)]
+        alpha = 0.17 if row.classification in ["L", "R"] else 0.35
+        ax_spatial.plot(raw_s, raw_y, color=color, lw=0.8, alpha=alpha, zorder=1)
+
+    for group in ["L", "R"]:
+        group_grid = combined_grid[combined_grid["classification"] == group]
+        if group_grid.empty:
+            continue
+        y_grid = group_grid["y"].to_numpy(dtype=float)
+        mean_s = group_grid["mean_s"].to_numpy(dtype=float)
+        q25 = group_grid["q25_s"].to_numpy(dtype=float)
+        q75 = group_grid["q75_s"].to_numpy(dtype=float)
+        color = LR_COLORS[group]
+        ax_spatial.fill_betweenx(
+            y_grid, q25, q75, color=color, alpha=0.20, linewidth=0.0, zorder=2
+        )
+        ax_spatial.plot(
+            mean_s,
+            y_grid,
+            color=color,
+            lw=3.0,
+            label=f"{group} mean (N={int(summary[f'N_{group}'])})",
+            zorder=3,
+        )
+
+    for group in ["L", "deadband", "R"]:
+        rows = included[included["classification"] == group]
+        if rows.empty:
+            continue
+        ax_spatial.scatter(
+            rows["s_int"],
+            np.full(len(rows), args.middle_line_y),
+            s=22 if group != "deadband" else 28,
+            color=LR_COLORS[group],
+            edgecolors="white",
+            linewidths=0.35,
+            alpha=0.9,
+            zorder=4,
+        )
+    ax_spatial.set_xlabel("Ball Lateral s [m] (+s = robot-base +X)")
+    ax_spatial.set_ylabel("Table Y [m]")
+    ax_spatial.set_title("Motion Onset to Interpolated Middle-Line Crossing")
+    ax_spatial.legend(loc="best", framealpha=0.9)
+
+    finite_s = included["s_int"].to_numpy(dtype=float)
+    finite_s = finite_s[np.isfinite(finite_s)]
+    if finite_s.size:
+        bins = np.linspace(float(np.min(finite_s)), float(np.max(finite_s)), 25)
+        if np.isclose(bins[0], bins[-1]):
+            bins = np.linspace(bins[0] - 0.01, bins[-1] + 0.01, 25)
+        for group in ["L", "R"]:
+            values = included.loc[
+                included["classification"] == group, "s_int"
+            ].to_numpy(dtype=float)
+            if values.size:
+                ax_distribution.hist(
+                    values,
+                    bins=bins,
+                    color=LR_COLORS[group],
+                    alpha=0.48,
+                    label=group,
+                )
+                mean = float(np.mean(values))
+                median = float(np.median(values))
+                ax_distribution.axvline(mean, color=LR_COLORS[group], lw=2.0)
+                ax_distribution.axvline(
+                    median, color=LR_COLORS[group], lw=1.6, ls="--"
+                )
+    eps = float(args.lr_deadband_epsilon_m)
+    ax_distribution.axvspan(-eps, eps, color=LR_COLORS["deadband"], alpha=0.16)
+    ax_distribution.axvline(0.0, color="0.2", lw=0.9, ls=":")
+    ax_distribution.invert_xaxis()
+    ax_distribution.set_xlabel("s at interception [m]")
+    ax_distribution.set_ylabel("Episodes")
+    ax_distribution.set_title(f"Interception Distribution (deadband ±{eps:.3f} m)")
+    ax_distribution.legend(title="Solid mean; dashed median", fontsize=9, title_fontsize=8)
+
+    groups = ["L", "deadband", "R"]
+    counts = np.asarray(
+        [summary["N_L"], summary["N_deadband"], summary["N_R"]], dtype=int
+    )
+    denominator = int(summary["usable_episodes"])
+    percentages = 100.0 * counts / denominator if denominator else np.zeros(3)
+    bars = ax_counts.bar(
+        groups, counts, color=[LR_COLORS[group] for group in groups], alpha=0.78
+    )
+    for bar, group, count, percentage in zip(bars, groups, counts, percentages):
+        label_group = "Deadband" if group == "deadband" else group
+        ax_counts.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            bar.get_height(),
+            f"{label_group}: {count} ({percentage:.1f}%)",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+        )
+    bias = float(summary["directional_count_bias_B"])
+    bias_text = "undefined" if not np.isfinite(bias) else f"{bias:+.4f}"
+    ax_counts.text(
+        0.5,
+        0.94,
+        f"B = (N_L - N_R) / (N_L + N_R) = {bias_text}",
+        transform=ax_counts.transAxes,
+        ha="center",
+        va="top",
+        fontsize=11,
+    )
+    ax_counts.text(
+        0.5,
+        0.86,
+        "Percent of usable episodes (deadband included)",
+        transform=ax_counts.transAxes,
+        ha="center",
+        va="top",
+        fontsize=9,
+        color="0.3",
+    )
+    ax_counts.set_ylabel("Episodes")
+    ax_counts.set_title(
+        f"Counts and Directional Bias — usable {denominator}, excluded {int(summary['excluded_episodes'])}"
+    )
+    ax_counts.set_ylim(0.0, max(float(np.max(counts)) * 1.55, 1.0))
+    ax_counts.spines[["top", "right"]].set_visible(False)
+
+    fig.suptitle("Combined L/R Trajectory-Distribution Analysis", fontsize=16)
+    fig.subplots_adjust(top=0.91, bottom=0.09, left=0.07, right=0.98)
+    for path in out_paths:
+        fig.savefig(path, dpi=args.dpi)
+    plt.close(fig)
+
+
+def write_trajectory_distribution_outputs(
+    out_dir: Path,
+    analysis: TrajectoryDistributionAnalysis,
+) -> List[str]:
+    filenames = [
+        "ball_trajectory_distribution_lr_summary.csv",
+        "ball_trajectory_distribution_lr_episodes.csv",
+        "ball_trajectory_distribution_lr_mean_grid.csv",
+    ]
+    analysis.summary.to_csv(out_dir / filenames[0], index=False)
+    analysis.episodes.to_csv(out_dir / filenames[1], index=False)
+    analysis.mean_grid.to_csv(out_dir / filenames[2], index=False)
+    return filenames
+
+
 def _resolve_output_dir(combined: CombinedDataset, args: argparse.Namespace) -> Path:
     if args.out_dir:
         return Path(args.out_dir).expanduser().resolve()
@@ -788,6 +1294,17 @@ def write_plot_metadata(
         "classic_selection": args.classic_selection,
         "generated_filenames": list(generated_files),
     }
+    if args.trajectory_distribution:
+        payload["trajectory_distribution"] = {
+            "enabled": True,
+            "interception_definition": "first_post_onset_forward_middle_line_crossing",
+            "deadband_epsilon_m": args.lr_deadband_epsilon_m,
+            "percentage_denominator": "usable_including_deadband",
+            "mean_trajectory_grid_points": TRAJECTORY_DISTRIBUTION_GRID_POINTS,
+            "mean_trajectory_independent_axis": "table_y",
+            "monotonicization": "chronological_strictly_increasing_y_frontier",
+            "extrapolation": False,
+        }
     (out_dir / "plot_metadata.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -831,6 +1348,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--table-x-limits", nargs=2, type=float, default=[0.0, 0.6])
     parser.add_argument("--table-y-limits", nargs=2, type=float, default=[0.0, 1.2])
 
+    parser.add_argument(
+        "--trajectory-distribution",
+        action="store_true",
+        help=(
+            "Generate opt-in L/R trajectory-distribution figure and CSV reports "
+            "using interpolated post-onset middle-line crossings"
+        ),
+    )
+    parser.add_argument(
+        "--lr-deadband-epsilon-m",
+        type=float,
+        default=0.005,
+        help="L/R classification deadband half-width in metres (default: 0.005)",
+    )
+
     parser.add_argument("--interactive", action="store_true", help="Show figures interactively after saving")
     return parser.parse_args()
 
@@ -843,6 +1375,8 @@ def main() -> None:
         raise RuntimeError("--motion-smoothing-window must be positive")
     if args.s_sign == 0.0:
         raise RuntimeError("--s-sign must be non-zero")
+    if not np.isfinite(args.lr_deadband_epsilon_m) or args.lr_deadband_epsilon_m < 0.0:
+        raise RuntimeError("--lr-deadband-epsilon-m must be finite and non-negative")
 
     formats = _ensure_formats(args.formats)
     enabled_events = _resolve_enabled_events(args.mark_events)
@@ -878,6 +1412,33 @@ def main() -> None:
     _plot_s_time_overlay(combined, event_info, classic_map, enabled_events, args, st_paths)
 
     generated_files = [p.name for p in xy_paths + st_paths]
+    if args.trajectory_distribution:
+        analysis = analyze_trajectory_distribution(combined, args)
+        distribution_formats = list(dict.fromkeys(["png"] + formats))
+        distribution_paths = [
+            out_dir / f"ball_trajectory_distribution_lr.{fmt}"
+            for fmt in distribution_formats
+        ]
+        _plot_trajectory_distribution(analysis, args, distribution_paths)
+        generated_files.extend(path.name for path in distribution_paths)
+        generated_files.extend(
+            write_trajectory_distribution_outputs(out_dir, analysis)
+        )
+        log("Trajectory-distribution summary:")
+        for row in analysis.summary.itertuples(index=False):
+            label = "combined" if row.scope == "combined" else row.source_id
+            log(
+                f"  {label}: usable={row.usable_episodes} excluded={row.excluded_episodes} "
+                f"L={row.N_L} ({row.pct_L:.1f}%) "
+                f"R={row.N_R} ({row.pct_R:.1f}%) "
+                f"deadband={row.N_deadband} ({row.pct_deadband:.1f}%) "
+                f"B={row.directional_count_bias_B:+.4f}"
+            )
+        excluded = analysis.episodes[~analysis.episodes["included"]]
+        if not excluded.empty:
+            log("Trajectory-distribution exclusions:")
+            for reason, count in excluded["exclusion_reason"].value_counts().items():
+                log(f"  {reason}: {count}")
     write_plot_metadata(out_dir, combined, args, generated_files)
 
     if args.interactive:

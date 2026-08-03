@@ -136,7 +136,7 @@ def assign_timestamps_to_episode_ids(
 
 
 def resolve_dataset_csv_dir(input_path: str) -> Path:
-    """Resolve dataset_csv directory from either dataset_csv path or bag path."""
+    """Resolve dataset_csv from a dataset, bag, or single-bag recording parent."""
     p = Path(input_path).expanduser().resolve()
     candidate_a = p / "manifest.csv"
     if candidate_a.exists():
@@ -145,6 +145,15 @@ def resolve_dataset_csv_dir(input_path: str) -> Path:
     candidate_b = p / "dataset_csv" / "manifest.csv"
     if candidate_b.exists():
         return p / "dataset_csv"
+
+    nested = sorted(p.glob("*_bag/dataset_csv/manifest.csv")) if p.is_dir() else []
+    if len(nested) == 1:
+        return nested[0].parent
+    if len(nested) > 1:
+        raise RuntimeError(
+            f"Found multiple nested dataset_csv sources under '{p}': "
+            f"{[str(path.parent) for path in nested]}. Pass one explicitly."
+        )
 
     raise RuntimeError(
         f"Could not find manifest.csv under '{p}'. "
@@ -414,3 +423,124 @@ def validate_no_duplicate_source_ids(source_ids: Iterable[str]) -> None:
             "Duplicate source_id values detected across inputs: "
             f"{dup}. Re-run extraction with --source-id to disambiguate."
         )
+
+
+def classify_lateral_intercept(s_intercept: float, epsilon_m: float) -> str:
+    """Classify the reached side using the canonical signed-s convention."""
+    if not np.isfinite(epsilon_m) or epsilon_m < 0.0:
+        raise ValueError("epsilon_m must be finite and non-negative")
+    if not np.isfinite(s_intercept):
+        return "unavailable"
+    if s_intercept > epsilon_m:
+        return "L"
+    if s_intercept < -epsilon_m:
+        return "R"
+    return "deadband"
+
+
+def directional_count_bias(n_left: int, n_right: int) -> float:
+    """Return (N_L - N_R) / (N_L + N_R), or NaN without directional data."""
+    denominator = int(n_left) + int(n_right)
+    if denominator == 0:
+        return float("nan")
+    return float((int(n_left) - int(n_right)) / denominator)
+
+
+def sample_descriptive_statistics(values: Sequence[float]) -> Dict[str, float]:
+    """Return count/location/spread statistics with sample standard deviation."""
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    count = int(arr.size)
+    if count == 0:
+        return {
+            "count": 0,
+            "mean": float("nan"),
+            "sample_std": float("nan"),
+            "median": float("nan"),
+            "q25": float("nan"),
+            "q75": float("nan"),
+            "iqr": float("nan"),
+        }
+    q25, q75 = np.quantile(arr, [0.25, 0.75])
+    return {
+        "count": count,
+        "mean": float(np.mean(arr)),
+        "sample_std": float(np.std(arr, ddof=1)) if count >= 2 else float("nan"),
+        "median": float(np.median(arr)),
+        "q25": float(q25),
+        "q75": float(q75),
+        "iqr": float(q75 - q25),
+    }
+
+
+def select_monotonic_approach_points(
+    y: Sequence[float],
+    s: Sequence[float],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Select a deterministic strictly increasing-y copy in input-time order.
+
+    Exact duplicate and backward-y points are discarded. This preserves the
+    first observation at each reached y frontier without smoothing raw data.
+    """
+    y_arr = np.asarray(y, dtype=float)
+    s_arr = np.asarray(s, dtype=float)
+    if y_arr.shape != s_arr.shape:
+        raise ValueError("y and s must have identical shapes")
+
+    out_y: List[float] = []
+    out_s: List[float] = []
+    for y_value, s_value in zip(y_arr, s_arr):
+        if not (np.isfinite(y_value) and np.isfinite(s_value)):
+            continue
+        if not out_y or float(y_value) > out_y[-1]:
+            out_y.append(float(y_value))
+            out_s.append(float(s_value))
+    return np.asarray(out_y, dtype=float), np.asarray(out_s, dtype=float)
+
+
+def interpolate_approach_on_y_grid(
+    y: Sequence[float],
+    s: Sequence[float],
+    y_grid: Sequence[float],
+) -> np.ndarray:
+    """Interpolate one episode on y_grid without extrapolation."""
+    y_arr = np.asarray(y, dtype=float)
+    s_arr = np.asarray(s, dtype=float)
+    grid = np.asarray(y_grid, dtype=float)
+    out = np.full(grid.shape, np.nan, dtype=float)
+    if y_arr.size < 2 or y_arr.shape != s_arr.shape:
+        return out
+    if np.any(np.diff(y_arr) <= 0.0):
+        raise ValueError("episode y values must be strictly increasing")
+    covered = (grid >= y_arr[0]) & (grid <= y_arr[-1])
+    out[covered] = np.interp(grid[covered], y_arr, s_arr)
+    return out
+
+
+def summarize_episode_grid(values_by_episode: np.ndarray) -> Dict[str, np.ndarray]:
+    """Summarize an episode-by-grid matrix with equal episode weight."""
+    values = np.asarray(values_by_episode, dtype=float)
+    if values.ndim != 2:
+        raise ValueError("values_by_episode must be a two-dimensional array")
+    n_grid = values.shape[1]
+    count = np.sum(np.isfinite(values), axis=0).astype(int)
+    mean = np.full(n_grid, np.nan, dtype=float)
+    sample_std = np.full(n_grid, np.nan, dtype=float)
+    q25 = np.full(n_grid, np.nan, dtype=float)
+    q75 = np.full(n_grid, np.nan, dtype=float)
+    for idx in range(n_grid):
+        col = values[:, idx]
+        col = col[np.isfinite(col)]
+        if col.size == 0:
+            continue
+        mean[idx] = float(np.mean(col))
+        if col.size >= 2:
+            sample_std[idx] = float(np.std(col, ddof=1))
+        q25[idx], q75[idx] = np.quantile(col, [0.25, 0.75])
+    return {
+        "count": count,
+        "mean": mean,
+        "sample_std": sample_std,
+        "q25": q25,
+        "q75": q75,
+    }
