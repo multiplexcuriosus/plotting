@@ -196,6 +196,7 @@ def test_no_combined_csv_is_written(tmp_path: Path):
         s_sign=-1.0,
         table_x_limits=[0.0, 0.6],
         table_y_limits=[0.0, 1.2],
+        shaded_outside=0.15,
         interactive=False,
     )
 
@@ -520,7 +521,8 @@ def test_distribution_figure_and_csv_outputs_are_created_and_closed(tmp_path: Pa
     )
     args = types.SimpleNamespace(
         table_x_limits=[0.0, 0.6], table_y_limits=[0.0, 0.8], line_center_x=0.3,
-        s_sign=-1.0, middle_line_y=0.6, lr_deadband_epsilon_m=0.005, dpi=80,
+        s_sign=-1.0, middle_line_y=0.6, shaded_outside=0.15,
+        lr_deadband_epsilon_m=0.005, dpi=80,
     )
     figure_path = tmp_path / "distribution.png"
     pid._plot_trajectory_distribution(analysis, args, [figure_path])

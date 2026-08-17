@@ -799,6 +799,12 @@ def _plot_xy_overlay(
     ax.set_ylim(table_ylim)
     ax.set_aspect("equal", adjustable="box")
 
+    shaded_outside = float(args.shaded_outside)
+    if s_min < -shaded_outside:
+        ax.axvspan(s_min, min(-shaded_outside, s_max), color="0.25", alpha=0.35, zorder=0)
+    if s_max > shaded_outside:
+        ax.axvspan(max(shaded_outside, s_min), s_max, color="0.25", alpha=0.35, zorder=0)
+
     # Subtle table boundary and middle line.
     rect_s = [s_min, s_max, s_max, s_min, s_min]
     rect_y = [table_ylim[0], table_ylim[0], table_ylim[1], table_ylim[1], table_ylim[0]]
@@ -1049,6 +1055,15 @@ def _plot_trajectory_distribution(
     ax_spatial.invert_xaxis()
     ax_spatial.set_ylim(table_ylim)
     ax_spatial.set_aspect("equal", adjustable="box")
+    shaded_outside = float(args.shaded_outside)
+    if s_min < -shaded_outside:
+        ax_spatial.axvspan(
+            s_min, min(-shaded_outside, s_max), color="0.25", alpha=0.35, zorder=0
+        )
+    if s_max > shaded_outside:
+        ax_spatial.axvspan(
+            max(shaded_outside, s_min), s_max, color="0.25", alpha=0.35, zorder=0
+        )
     ax_spatial.plot(
         [s_min, s_max, s_max, s_min, s_min],
         [table_ylim[0], table_ylim[0], table_ylim[1], table_ylim[1], table_ylim[0]],
@@ -1347,6 +1362,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--s-sign", type=float, default=-1.0)
     parser.add_argument("--table-x-limits", nargs=2, type=float, default=[0.0, 0.6])
     parser.add_argument("--table-y-limits", nargs=2, type=float, default=[0.0, 1.2])
+    parser.add_argument(
+        "--shaded-outside",
+        type=float,
+        default=0.15,
+        metavar="VAR",
+        help="Shade the XY overlay where |s| > VAR metres (default: 0.15)",
+    )
 
     parser.add_argument(
         "--trajectory-distribution",
@@ -1375,6 +1397,8 @@ def main() -> None:
         raise RuntimeError("--motion-smoothing-window must be positive")
     if args.s_sign == 0.0:
         raise RuntimeError("--s-sign must be non-zero")
+    if not np.isfinite(args.shaded_outside) or args.shaded_outside < 0.0:
+        raise RuntimeError("--shaded-outside must be finite and non-negative")
     if not np.isfinite(args.lr_deadband_epsilon_m) or args.lr_deadband_epsilon_m < 0.0:
         raise RuntimeError("--lr-deadband-epsilon-m must be finite and non-negative")
 
