@@ -124,7 +124,7 @@ TOPICS=(
 # Camera images are recorded by default.
 if [[ "$RECORD_IMAGES" == true ]]; then
   TOPICS+=(
-    /top_cam/camera/color/image_raw
+    #/top_cam/camera/color/image_raw
     /openmv_cam/event_frame_3ch 
     /top_cam/camera/color/camera_info
   )
