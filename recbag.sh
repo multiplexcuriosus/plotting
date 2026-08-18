@@ -77,9 +77,15 @@ TOPICS=(
 
   # Continuous tracking request and measured robot position
   /cont_tracker/accepted_target_s
+  /cont_tracker/accepted_target_base
   /cont_tracker/target_s
   /cont_tracker/track_s
   /middle_line/current_tcp_s
+
+  /trajectory_executor/executed_goto_s
+  /trajectory_executor/executed_goto_s_target_base
+  /trajectory_executor/middle_line_state
+  /cartesian_executor/status
 
   # Robot measurements
   /joint_states
@@ -95,6 +101,22 @@ TOPICS=(
   /tf
   /tf_static
 
+  # Explicit latency and execution traces
+  /intercept_trace/ball_tracker2
+  /intercept_trace/event_2d_ball_detection
+  /intercept_trace/localization_2d_to_3d
+  /intercept_trace/trajectory_estimation
+  /intercept_trace/controller
+  /trajectory_execution_event
+
+  /openmv_cam/event_tracker/ball_2d_px
+  /openmv_cam/event_tracker/ball_velocity_px_s
+  /openmv_cam/event_tracker/valid
+
+  /aruco_top_cam/aruco_detections
+  /scene_localizer/top_cam/ball_3d_camera
+
+
   # Errors, cancellations, and reflex messages
   /rosout
 )
@@ -103,7 +125,7 @@ TOPICS=(
 if [[ "$RECORD_IMAGES" == true ]]; then
   TOPICS+=(
     /top_cam/camera/color/image_raw
-    /openmv_cam/event_frame_3ch
+    /openmv_cam/event_frame_3ch 
     /top_cam/camera/color/camera_info
   )
 fi
