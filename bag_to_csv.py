@@ -579,12 +579,23 @@ def flatten_message(
     if twist_row is not None:
         return twist_row
 
+    # Prediction chunks are analysis data, not opaque payloads.  Their usual
+    # length (currently 60) exceeds the generic array-expansion guard's default
+    # of 32, which previously produced a CSV containing only ``data_len`` and
+    # made the rollout plots unusable.  Always retain the complete chunk while
+    # leaving the configured guard in place for unrelated large arrays.
+    effective_max_array_len = max_array_len
+    if topic == "/act/intercept_prediction_chunk_abs_s":
+        prediction_data = getattr(msg, "data", None)
+        if prediction_data is not None and is_sequence_like(prediction_data):
+            effective_max_array_len = max(effective_max_array_len, len(prediction_data))
+
     row: Dict[str, Any] = {}
     add_header_fields(row, msg)
     row.update(
         flatten_generic(
             msg,
-            max_array_len=max_array_len,
+            max_array_len=effective_max_array_len,
             skip_top_level_header=True,
         )
     )
